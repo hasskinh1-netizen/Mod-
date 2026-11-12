@@ -743,3 +743,37 @@ void AllFieldIterator::IterateToNextStructWithMembers()
         Fields = GetCurrentStruct().GetProperties();
     }
 }
+
+/*
+* Explicit instantiations.
+*
+* The template bodies live in this .cpp, so other translation units can only link
+* against symbols emitted here. At -O2 (Release) clang fully inlines / discards the
+* small dummy-function uses above, which leaves GetByIndex<T> undefined for every
+* specialization that is not otherwise emitted. Explicit instantiation guarantees
+* the symbols exist in every configuration.
+*/
+#define INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEType)                                  \
+	template UEType ObjectArray::GetByIndex<UEType>(int32);                         \
+	template UEType ObjectArray::FindObject<UEType>(const std::string&, EClassCastFlags); \
+	template UEType ObjectArray::FindObjectFast<UEType>(const std::string&, EClassCastFlags); \
+	template UEType ObjectArray::FindObjectFastInOuter<UEType>(const std::string&, std::string);
+
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEObject)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEField)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEEnum)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEStruct)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEClass)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEFunction)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEByteProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEBoolProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEObjectProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEClassProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEStructProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEArrayProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEMapProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UESetProperty)
+INSTANTIATE_OBJECT_ARRAY_TEMPLATES(UEEnumProperty)
+
+#undef INSTANTIATE_OBJECT_ARRAY_TEMPLATES
