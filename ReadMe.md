@@ -1,5 +1,7 @@
 # iOS-Dumper-7
 
+[![Build Dumper.dylib](https://github.com/hasskinh1-netizen/Mod-/actions/workflows/build.yml/badge.svg)](https://github.com/hasskinh1-netizen/Mod-/actions/workflows/build.yml)
+
 **iOS-Dumper-7** is a runtime SDK generator for Unreal Engine games on iOS / arm64. It loads as a dylib inside the game process, scans memory to discover the engine's reflection layout, then emits a complete C++ SDK, IDA mapping files, JSON metadata, and a single-header summary of every offset it found.
 
 Originally a port of [Encryqed/Dumper-7](https://github.com/Encryqed/Dumper-7) (Windows/x86_64) — heavily reworked for iOS/clang/Mach-O.
@@ -30,6 +32,8 @@ Originally a port of [Encryqed/Dumper-7](https://github.com/Encryqed/Dumper-7) (
 1. Open `Dumper.xcodeproj` in Xcode.
 2. Set your signing identity.
 3. Build target `Dumper` → produces `Dumper.dylib` under `build/Release-iphoneos/`.
+
+Or let CI build it: push to `main` (or run the **Build Dumper.dylib** workflow manually), then download `Dumper.dylib.zip` from the Actions run artifacts. Pushing a tag like `v1.0` also attaches the zip to a GitHub Release.
 
 ### 2. Inject
 
