@@ -92,6 +92,9 @@ public:
 
 	static void Init(int32 OverrideOffset, EOffsetOverrideType OverrideType = EOffsetOverrideType::AppendString, bool bIsNamePool = false, const char* const ModuleName = nullptr);
 
+	/* True once ToStr/AppendString has been resolved; calling ToString() before this crashes. */
+	static bool IsInitialized() { return ToStr != nullptr; }
+
 public:
 	inline const void* GetAddress() const { return Address; }
 

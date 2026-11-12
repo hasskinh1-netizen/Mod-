@@ -1,4 +1,5 @@
 #include <format>
+#include <stdexcept>
 #include <thread>
 #include <chrono>
 
@@ -509,9 +510,7 @@ std::vector<std::pair<FName, int64>> UEEnum::GetNameValuePairs() const
 		if (!bIsNamesPtrTagged)
 		{
 			/* StaticNamesUTF8 is not supported yet. See: https://github.com/EpicGames/UnrealEngine/blob/ue5-main/Engine/Source/Runtime/CoreUObject/Public/UObject/Class.h#L3408*/
-			LogError("Dumper-7 [UEEnum::GetNameValuePairs()]: UEnum::Names pointer is tagged! This is not supported yet!");
-			std::this_thread::sleep_for(std::chrono::seconds(100));
-			exit(1);
+			throw std::runtime_error("Dumper-7 [UEEnum::GetNameValuePairs()]: UEnum::Names pointer is tagged! This is not supported yet!");
 		}
 
 		const int64* Values = reinterpret_cast<int64*>(*reinterpret_cast<uintptr_t*>(Object + EnumNamesOffset + 0x8) & PointerMaskNoTag);

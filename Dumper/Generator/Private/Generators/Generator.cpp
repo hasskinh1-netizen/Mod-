@@ -51,10 +51,17 @@ static int32 FindOffsetByIDAPatterns(std::initializer_list<std::pair<const char*
 }
 
 
-void Generator::InitEngineCore()
+bool Generator::InitEngineCore()
 {
 	LogInfo("Initializing Engine Core...");
 	ObjectArray::Init();
+	if (ObjectArray::DEBUGGetGObjects() == nullptr)
+	{
+		LogError("Dump aborted: GObjects (global object array) was not found. "
+		         "This game/version is not supported by the current auto-scan.");
+		return false;
+	}
+
 	/* Per-game FName decryption hooks. Install BEFORE FName::Init.
 	 * Pick whichever match the target game; unused hooks default to identity.
 	 *
@@ -85,10 +92,38 @@ void Generator::InitEngineCore()
 	 *     return Start;
 	 * });
 	 */
-	int32 GNamesOff = FindOffsetByIDAPatterns({
-		{"? ? ? ? 29 01 15 91 28 21 08 8B", 0}, // HOK: World
+
+	/* Optional per-game GNames override. Only applied when its signature actually
+	 * matches this binary; otherwise we fall back to full auto-detection so the
+	 * dumper works on non-NGR games instead of dereferencing garbage. */
+	const int32 GNamesOff = FindOffsetByIDAPatterns({
+		{"? ? ? ? 29 01 15 91 28 21 08 8B", 0}, // HOK: World / NGR
 	}, "GNames");
-	FName::Init(GNamesOff, FName::EOffsetOverrideType::GNames, true, "NGR");
+
+	bool bNameInitialized = false;
+	if (GNamesOff != 0)
+	{
+		/* "NGR" is only valid as a module name when that image is actually loaded. */
+		const char* const ModuleName = GetModuleBase("NGR") != 0 ? "NGR" : nullptr;
+		LogInfo("Applying per-game GNames override at 0x%X (module: %s)", GNamesOff, ModuleName ? ModuleName : "main executable");
+		FName::Init(GNamesOff, FName::EOffsetOverrideType::GNames, true, ModuleName);
+		bNameInitialized = FName::IsInitialized();
+	}
+
+	if (!bNameInitialized)
+	{
+		LogInfo("No matching GNames override; trying automatic FName/GNames detection...");
+		FName::Init(true);
+		bNameInitialized = FName::IsInitialized();
+	}
+
+	if (!bNameInitialized)
+	{
+		LogError("Dump aborted: FName/GNames could not be initialized. "
+		         "The game is likely encrypted or uses an unsupported FNamePool layout.");
+		return false;
+	}
+
 	Off::Init();
 	PropertySizes::Init();
 	Off::InSDK::ProcessEvent::InitPE(); //Must be at this position, relies on offsets initialized in Off::Init()
@@ -99,9 +134,10 @@ void Generator::InitEngineCore()
 
 	InitSettings();
 	LogSuccess("Engine Core initialized successfully");
+	return true;
 }
 
-void Generator::InitInternal()
+bool Generator::InitInternal()
 {
 	LogInfo("Initializing Internal Generator...");
 
@@ -121,6 +157,7 @@ void Generator::InitInternal()
 	PackageManager::PostInit();
 
 	LogSuccess("Internal Generator initialized successfully");
+	return true;
 }
 
 bool Generator::SetupDumperFolder()

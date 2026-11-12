@@ -355,9 +355,8 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
     if (GObjects == nullptr)
     {
-        LogError("GObjects couldn't be found!");
-        sleep(3);
-        exit(1);
+        LogError("GObjects couldn't be found! Aborting dump without terminating the host app.");
+        return;
     }
 }
 

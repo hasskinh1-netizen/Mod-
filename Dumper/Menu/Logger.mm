@@ -7,14 +7,47 @@
 
 #include "Logger.h"
 #include "Console.h" // Your Console class
+#import <Foundation/Foundation.h>
 #include <cstdarg>
 #include <cstdio>
+#include <mutex>
 #include <string>
+
+// Persist logs so a crash can still be diagnosed after the process dies, and
+// mirror them to the system log (visible in Console.app / idevice syslog).
+static void AppendToLogFile(const char* Line)
+{
+    static std::mutex FileMutex;
+    static FILE* LogFile = nullptr;
+
+    std::lock_guard<std::mutex> Lock(FileMutex);
+
+    if (!LogFile)
+    {
+        NSString* Documents = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (!Documents)
+            return;
+
+        NSString* Path = [Documents stringByAppendingPathComponent:@"Dumper.log"];
+        LogFile = fopen(Path.fileSystemRepresentation, "a");
+    }
+
+    if (LogFile)
+    {
+        fputs(Line, LogFile);
+        fputc('\n', LogFile);
+        fflush(LogFile);
+    }
+}
 
 // Helper to format string and send to console
 static void LogToConsole(int type, const char* fmt, va_list args) {
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
+
+    AppendToLogFile(buffer);
+    NSLog(@"[Dumper] %s", buffer);
+
     std::string msg(buffer);
 
     // Assuming Console follows Singleton pattern or global instance

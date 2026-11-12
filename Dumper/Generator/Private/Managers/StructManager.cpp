@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <stdexcept>
 #include <thread>
 #include <chrono>
 
@@ -222,9 +223,7 @@ void StructManager::InitSizesAndIsFinal()
 
 			if (It == StructInfoOverrides.end())
 			{
-				LogError("\n\n\nDumper-7: Error, struct wasn't found in 'StructInfoOverrides'! Exiting...\n\n\n");
-				std::this_thread::sleep_for(std::chrono::seconds(10));
-				exit(1);
+				throw std::runtime_error("Dumper-7: struct wasn't found in 'StructInfoOverrides'!");
 			}
 
 			StructInfo& Info = It->second;
