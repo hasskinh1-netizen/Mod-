@@ -305,7 +305,9 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
             uint8* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
 
-            ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8**>(ChunksPtr));
+            /* Fixed (non-chunked) arrays store FUObjectItem* directly, so pass
+             * the array base — not its first item's UObject pointer. */
+            ObjectArray::InitializeFUObjectItem(ChunksPtr);
 
             return;
         }
@@ -383,8 +385,16 @@ void ObjectArray::Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& Obj
 	};
 
 	uint8* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+	if (!ChunksPtr || IsBadReadPtr(ChunksPtr))
+	{
+		LogError("FFixedUObjectArray: Objects pointer is invalid (%p)", (void*)ChunksPtr);
+		GObjects = nullptr;
+		return;
+	}
 
-	ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8**>(ChunksPtr));
+	/* Fixed (non-chunked) arrays store FUObjectItem* directly, so pass the
+	 * array base — not its first item's UObject pointer. */
+	ObjectArray::InitializeFUObjectItem(ChunksPtr);
 	LogSuccess("FFixedUObjectArray initialized successfully");
 }
 

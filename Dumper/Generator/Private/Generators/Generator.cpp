@@ -54,11 +54,56 @@ static int32 FindOffsetByIDAPatterns(std::initializer_list<std::pair<const char*
 bool Generator::InitEngineCore()
 {
 	LogInfo("Initializing Engine Core...");
-	ObjectArray::Init();
+
+	/* ------------------------------------------------------------------
+	 * PUBG Mobile (UE 4.18, fixed TUObjectArray) detection.
+	 * Patterns/resolution taken from Mj0x's iOS_UEDumper PUBG profile.
+	 * ------------------------------------------------------------------ */
+	const int32 PUBGGObjectsOff = FindOffsetByIDAPatterns({
+		{"80 B9 ? ? ? ? ? ? ? 91 ? ? 40 F9 ? 03 80 52", 2},
+	}, "PUBG GObjects");
+
+	const int32 PUBGGNamesOff = FindOffsetByIDAPatterns({
+		{"ff c3 01 91 c0 03 5f d6 ? ? ? ? ? ? ? 91 ? ? ? 94 ? ? ? 34 ff ? ? ? ? ? ? ? ? ? ? 91", 0x1c},
+	}, "PUBG GNames");
+
+	if (PUBGGObjectsOff != 0)
+	{
+		/* The ADRP+ADD resolves to FUObjectArray; ObjObjects sits at +0x10.
+		 * UE <= 4.19 uses a flat (non-chunked) TUObjectArray relative to it:
+		 *   TUObjectArray.Objects      = +0x00  (FUObjectItem*)
+		 *   TUObjectArray.MaxElements  = +0x08
+		 *   TUObjectArray.NumElements  = +0x0C */
+		const int32 PUBGObjObjectsOff = PUBGGObjectsOff + 0x10;
+
+		const FFixedUObjectArrayLayout PUBGLayout
+		{
+			.ObjectsOffset    = 0x0,
+			.MaxObjectsOffset = 0x8,
+			.NumObjectsOffset = 0xC,
+		};
+
+		LogInfo("Detected PUBG Mobile GObjects (FUObjectArray+0x10) at 0x%X (fixed TUObjectArray)", PUBGObjObjectsOff);
+		ObjectArray::Init(PUBGObjObjectsOff, PUBGLayout, Settings::General::DefaultModuleName);
+	}
+	else
+	{
+		ObjectArray::Init();
+	}
+
 	if (ObjectArray::DEBUGGetGObjects() == nullptr)
 	{
 		LogError("Dump aborted: GObjects (global object array) was not found. "
 		         "This game/version is not supported by the current auto-scan.");
+		return false;
+	}
+
+	const int32 NumObjects = ObjectArray::Num();
+	LogInfo("GObjects NumElements: %d", NumObjects);
+	if (NumObjects <= 0 || NumObjects > 0x400000)
+	{
+		LogError("Dump aborted: GObjects looks invalid (NumElements=%d). "
+		         "Wait until the game is fully loaded, then press Start Dump again.", NumObjects);
 		return false;
 	}
 
@@ -96,18 +141,68 @@ bool Generator::InitEngineCore()
 	/* Optional per-game GNames override. Only applied when its signature actually
 	 * matches this binary; otherwise we fall back to full auto-detection so the
 	 * dumper works on non-NGR games instead of dereferencing garbage. */
-	const int32 GNamesOff = FindOffsetByIDAPatterns({
-		{"? ? ? ? 29 01 15 91 28 21 08 8B", 0}, // HOK: World / NGR
-	}, "GNames");
-
 	bool bNameInitialized = false;
-	if (GNamesOff != 0)
+
+	/* PUBG Mobile (UE 4.18): GNames is an encrypted TNameEntryArray.
+	 * ADRP+ADD resolves to [int32 Header | ptr FirstHop]; walking
+	 * Hops = (Header - 100) / 3 yields TNameEntryArray** (the runtime
+	 * dereferences once more inside NameArray::TryInit). */
+	if (PUBGGNamesOff != 0)
 	{
-		/* "NGR" is only valid as a module name when that image is actually loaded. */
-		const char* const ModuleName = GetModuleBase("NGR") != 0 ? "NGR" : nullptr;
-		LogInfo("Applying per-game GNames override at 0x%X (module: %s)", GNamesOff, ModuleName ? ModuleName : "main executable");
-		FName::Init(GNamesOff, FName::EOffsetOverrideType::GNames, true, ModuleName);
+		LogInfo("Detected PUBG Mobile GNames at 0x%X (encrypted TNameEntryArray)", PUBGGNamesOff);
+
+		InitNameArrayDecryption([](uintptr_t RawAddr) -> uintptr_t
+		{
+			if (!RawAddr || IsBadReadPtr((void*)RawAddr) || IsBadReadPtr((void*)(RawAddr + 8)))
+				return 0;
+
+			const int32_t Header = *reinterpret_cast<int32_t*>(RawAddr);
+			if (Header < 100) return 0;
+
+			uint32_t Hops = (uint32_t)((Header - 100) / 3);
+			if (Hops == 0 || Hops > 16) return 0;
+
+			uint64_t Chain[16]{};
+			Chain[Hops - 1] = *reinterpret_cast<int64_t*>(RawAddr + 8);
+
+			while (Hops >= 2)
+			{
+				const uintptr_t Next = Chain[Hops - 1];
+				if (!Next || IsBadReadPtr((void*)Next)) return 0;
+				Chain[Hops - 2] = *reinterpret_cast<int64_t*>(Next);
+				--Hops;
+			}
+
+			return Chain[0]; // TNameEntryArray** — NameArray::TryInit derefs once
+		});
+
+		FName::Init(PUBGGNamesOff, FName::EOffsetOverrideType::GNames, false, Settings::General::DefaultModuleName);
 		bNameInitialized = FName::IsInitialized();
+
+		if (!bNameInitialized)
+		{
+			/* Pattern matched but the chain produced an unusable array. Reset
+			 * to identity so the generic auto-detection below isn't poisoned
+			 * by the PUBG-specific decryption hook. */
+			InitNameArrayDecryption([](uintptr_t RawAddr) -> uintptr_t { return RawAddr; });
+			LogError("PUBG GNames override failed; falling back to auto-detection");
+		}
+	}
+
+	if (!bNameInitialized)
+	{
+		const int32 GNamesOff = FindOffsetByIDAPatterns({
+			{"? ? ? ? 29 01 15 91 28 21 08 8B", 0}, // HOK: World / NGR
+		}, "GNames");
+
+		if (GNamesOff != 0)
+		{
+			/* "NGR" is only valid as a module name when that image is actually loaded. */
+			const char* const ModuleName = GetModuleBase("NGR") != 0 ? "NGR" : nullptr;
+			LogInfo("Applying per-game GNames override at 0x%X (module: %s)", GNamesOff, ModuleName ? ModuleName : "main executable");
+			FName::Init(GNamesOff, FName::EOffsetOverrideType::GNames, true, ModuleName);
+			bNameInitialized = FName::IsInitialized();
+		}
 	}
 
 	if (!bNameInitialized)
@@ -122,6 +217,16 @@ bool Generator::InitEngineCore()
 		LogError("Dump aborted: FName/GNames could not be initialized. "
 		         "The game is likely encrypted or uses an unsupported FNamePool layout.");
 		return false;
+	}
+
+	/* PUBG Mobile is UE 4.18: FName is { int32 ComparisonIndex; int32 Number; }.
+	 * The generic heuristic in OffsetFinder::InitFNameSettings() reads GObjects[0]
+	 * ('None' => both int32s are 0) and would wrongly conclude that the game uses
+	 * WITH_CASE_PRESERVING_NAME + FNAME_OUTLINE_NUMBER. */
+	if (PUBGGObjectsOff != 0 || PUBGGNamesOff != 0)
+	{
+		Settings::Internal::bForcedLegacyFNameLayout = true;
+		LogInfo("PUBG profile: forcing legacy FName layout (UE <= 4.19)");
 	}
 
 	Off::Init();
@@ -290,18 +395,27 @@ void DumpUEOffsetsHeader(const fs::path& DumperFolder)
 	Out << "}\n\n";
 
 	Out << "namespace FUObjectArray\n{\n";
-	Out << "    // Off::InSDK::ObjArray::GObjects already points at the ObjObjects sub-struct.\n";
+	Out << "    // Off::InSDK::ObjArray::GObjects points at the ObjObjects sub-struct.\n";
 	Out << "    constexpr uintptr_t ObjObjects = " << 0 << ";\n";
 	Out << "}\n\n";
 
 	Out << "namespace TUObjectArray\n{\n";
-	Out << "    constexpr uintptr_t Objects             = " << Off::FUObjectArray::ChunkedFixedLayout.ObjectsOffset << ";\n";
-	Out << "    constexpr uintptr_t NumElements         = " << Off::FUObjectArray::ChunkedFixedLayout.NumElementsOffset << ";\n";
-	Out << "    constexpr uintptr_t NumElementsPerChunk = " << Off::InSDK::ObjArray::ChunkSize << ";\n";
+	if (Off::FUObjectArray::bIsChunked)
+	{
+		Out << "    constexpr uintptr_t Objects             = " << Off::FUObjectArray::ChunkedFixedLayout.ObjectsOffset << ";\n";
+		Out << "    constexpr uintptr_t NumElements         = " << Off::FUObjectArray::ChunkedFixedLayout.NumElementsOffset << ";\n";
+		Out << "    constexpr uintptr_t NumElementsPerChunk = " << Off::InSDK::ObjArray::ChunkSize << ";\n";
+	}
+	else
+	{
+		Out << "    constexpr uintptr_t Objects             = " << Off::FUObjectArray::FixedLayout.ObjectsOffset << ";\n";
+		Out << "    constexpr uintptr_t NumElements         = " << Off::FUObjectArray::FixedLayout.NumObjectsOffset << ";\n";
+		Out << "    constexpr uintptr_t NumElementsPerChunk = 0;\n";
+	}
 	Out << "}\n\n";
 
 	Out << "namespace FUObjectItem\n{\n";
-	Out << "    constexpr uintptr_t Object = " << 0 << ";\n";
+	Out << "    constexpr uintptr_t Object = " << Off::InSDK::ObjArray::FUObjectItemInitialOffset << ";\n";
 	Out << "    constexpr uintptr_t Size   = " << Off::InSDK::ObjArray::FUObjectItemSize << ";\n";
 	Out << "}\n\n";
 

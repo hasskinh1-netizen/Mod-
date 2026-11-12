@@ -218,6 +218,9 @@ bool NameArray::InitializeNameArray(uint8* NameArray)
                 Off::NameArray::NumElements = i;
                 Off::NameArray::MaxChunkIndex = i + 4;
 
+                LogInfo("TNameEntryArray layout: NumElementsOffset=0x%X, NumChunksOffset=0x%X, NumChunks=%d",
+                        Off::NameArray::NumElements, Off::NameArray::MaxChunkIndex, NumChunks);
+
                 ByIndex = [](void* NamesArray, int32 ComparisonIndex, int32 NamePoolBlockOffsetBits) -> void*
                 {
                     const int32 ChunkIdx = ComparisonIndex / 0x4000;

@@ -293,6 +293,17 @@ void OffsetFinder::FixupHardcodedOffsets()
 
 void OffsetFinder::InitFNameSettings()
 {
+	if (Settings::Internal::bForcedLegacyFNameLayout)
+	{
+		Settings::Internal::bUseCasePreservingName = false;
+		Settings::Internal::bUseOutlineNumberName = false;
+		Off::FName::CompIdx = 0x0;
+		Off::FName::Number = 0x4;
+		Off::InSDK::Name::FNameSize = 0x8;
+		LogInfo("InitFNameSettings: forced legacy FName layout (ComparisonIndex + Number, size 8)");
+		return;
+	}
+
 	UEObject FirstObject = ObjectArray::GetByIndex(0);
 
 	const uint8* NameAddress = static_cast<const uint8*>(FirstObject.GetFName().GetAddress());
@@ -371,6 +382,16 @@ void OffsetFinder::InitFNameSettings()
 
 void OffsetFinder::PostInitFNameSettings()
 {
+	if (Settings::Internal::bForcedLegacyFNameLayout)
+	{
+		Settings::Internal::bUseCasePreservingName = false;
+		Settings::Internal::bUseOutlineNumberName = false;
+		Off::FName::CompIdx = 0x0;
+		Off::FName::Number = 0x4;
+		Off::InSDK::Name::FNameSize = 0x8;
+		return;
+	}
+
 	const UEClass PlayerStart = ObjectArray::FindClassFast("PlayerStart");
 
 	const int32 FNameSize = PlayerStart.FindMember("PlayerStartTag").GetSize();

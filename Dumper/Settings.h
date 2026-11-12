@@ -7,7 +7,7 @@
 /*
  * Selects the dumper's TCHAR width based on the target UE version.
  *
- * Verified against working ARK 2.0 (4.17) and ARK Revamp (4.26) iOS tweak references:
+ * Verified against working ARK 2.0 (4.17), PUBG Mobile (4.18) and ARK Revamp (4.26) iOS tweak references:
  *   - UE  <  4.21 : FString uses 32-bit chars on iOS → TCHAR = wchar_t,  TEXT(x) = L##x
  *   - UE >=  4.21 : FString uses 16-bit chars       → TCHAR = char16_t, TEXT(x) = u##x
  *
@@ -16,7 +16,7 @@
  *   - the emitted SDK's `using TCHAR = ...;` alias,
  *   - the emitted STATIC_NAME_IMPL literal prefix (L"..." vs u"...").
  */
-#define UEVERSION 426
+#define UEVERSION 418
 
 #if UEVERSION >= 421
 
@@ -199,6 +199,12 @@ R"(
 
 		/* Whether this games uses FNameOutlineNumber, moving the 'Number' component from FName into FNameEntry inside of FNamePool */
 		inline bool bUseOutlineNumberName = false;
+
+		/* Forces the classic UE <= 4.19 FName layout (int32 ComparisonIndex + int32 Number,
+		 * sizeof(FName) == 8) and skips the runtime heuristic in InitFNameSettings().
+		 * Needed on games where GObjects[0] is 'None' (both int32s are 0), which the
+		 * heuristic otherwise mistakes for WITH_CASE_PRESERVING_NAME + FNAME_OUTLINE_NUMBER. */
+		inline bool bForcedLegacyFNameLayout = false;
 
 		/* Whether this game uses the 'FFieldPathProperty' cast flags for a custom property 'FObjectPtrProperty' */
 		inline bool bIsObjPtrInsteadOfFieldPathProperty = false;
