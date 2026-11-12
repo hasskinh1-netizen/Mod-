@@ -1,0 +1,78 @@
+name: Build Dumper.dylib
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build iOS arm64 dylib
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Dumper.xcodeproj \
+            -target Dumper \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" \
+            build | tee xcodebuild.log
+
+      - name: Verify and package
+        run: |
+          ls -la build/Release-iphoneos
+          file build/Release-iphoneos/Dumper.dylib
+          lipo -info build/Release-iphoneos/Dumper.dylib
+          mkdir -p dist
+          cp build/Release-iphoneos/Dumper.dylib dist/
+          if [ -d build/Release-iphoneos/Dumper.dylib.dSYM ]; then
+            cp -R build/Release-iphoneos/Dumper.dylib.dSYM dist/
+          fi
+          cd dist && zip -r Dumper.dylib.zip .
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+
+      - name: Upload Dumper.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dumper.dylib
+          path: dist/Dumper.dylib.zip
+
+  release:
+    name: Attach dylib to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Dumper.dylib
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Dumper.dylib.zip
+          generate_release_notes: true
