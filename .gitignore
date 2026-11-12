@@ -10,5 +10,8 @@ DerivedData/
 *.xcuserstate
 *.xcuserdatad/
 
+# Locally downloaded CI artifacts
+artifacts/
+
 # macOS
 .DS_Store
