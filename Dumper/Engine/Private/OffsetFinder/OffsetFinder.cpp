@@ -5,8 +5,52 @@
 #include "Unreal/ObjectArray.h"
 
 #include "Platform.h"
+#include "Utils.h"
 
 #include "Menu/Logger.h"
+
+namespace
+{
+	/* Returns true when Address points into an executable segment of the
+	 * main image.  Native function pointers (UFunction::ExecFunction) live in
+	 * __TEXT, while regular UObject pointers live on the heap; checking the
+	 * process range alone is not enough because heap addresses are readable
+	 * too (e.g. UStruct::Children at +0x38). */
+	bool IsExecutableAddress(const uintptr_t Address)
+	{
+		if (!Address)
+			return false;
+
+		/* Strip pointer-authentication bits that arm64e may leave behind. */
+		const uintptr_t Pointer = Address & 0x0000FFFFFFFFFFFFULL;
+
+		if ((Pointer & 0x3) != 0)
+			return false;
+
+		const MachImageInfo Image = GetImageBaseAndSize();
+		if (!Image.Header)
+			return false;
+
+		uintptr_t CommandPtr = reinterpret_cast<uintptr_t>(Image.Header + 1);
+		for (uint32_t i = 0; i < Image.Header->ncmds; ++i)
+		{
+			const auto* Command = reinterpret_cast<const struct load_command*>(CommandPtr);
+			if (Command->cmd == LC_SEGMENT_64)
+			{
+				const auto* Segment = reinterpret_cast<const struct segment_command_64*>(Command);
+				if ((Segment->initprot & VM_PROT_EXECUTE) != 0)
+				{
+					const uintptr_t Start = Segment->vmaddr + Image.Slide;
+					if (Pointer >= Start && Pointer < Start + Segment->vmsize)
+						return true;
+				}
+			}
+			CommandPtr += Command->cmdsize;
+		}
+
+		return false;
+	}
+}
 /* UObject */
 int32_t OffsetFinder::FindUObjectFlagsOffset()
 {
@@ -771,6 +815,13 @@ int32_t OffsetFinder::FindMinAlignmentOffset()
 
 int32_t OffsetFinder::FindStructBaseChainOffset()
 {
+	/* FStructBaseChain was introduced together with FProperty (UE 4.25+).
+	 * On legacy UProperty builds there is no such member, and scanning for
+	 * it can match an unrelated integer field (PUBG 4.18 reports 0x88,
+	 * colliding with UFunction::FunctionFlags). */
+	if (!Settings::Internal::bUseFProperty)
+		return OffsetNotFound;
+
 	// UStruct inherits from FStructBaseChain, so the members of base chain should come right after UField
 
 	UEStruct Struct = ObjectArray::FindStructFast("Struct");
@@ -838,23 +889,40 @@ int32_t OffsetFinder::FindFunctionFlagsOffset()
 
 int32_t OffsetFinder::FindFunctionNativeFuncOffset()
 {
-	std::vector<std::pair<void*, EFunctionFlags>> Infos;
-
-	uintptr_t WasInputKeyJustPressed = reinterpret_cast<uintptr_t>(ObjectArray::FindObjectFast("WasInputKeyJustPressed", EClassCastFlags::Function).GetAddress());
-	uintptr_t ToggleSpeaking = reinterpret_cast<uintptr_t>(ObjectArray::FindObjectFast("ToggleSpeaking", EClassCastFlags::Function).GetAddress());
-	uintptr_t SwitchLevel_Or_FOV = reinterpret_cast<uintptr_t>(ObjectArray::FindObjectFast("SwitchLevel", EClassCastFlags::Function).GetAddress());
+	UEFunction WasInputKeyJustPressed = ObjectArray::FindObjectFast<UEFunction>("WasInputKeyJustPressed", EClassCastFlags::Function);
+	UEFunction ToggleSpeaking = ObjectArray::FindObjectFast<UEFunction>("ToggleSpeaking", EClassCastFlags::Function);
+	UEFunction SwitchLevel_Or_FOV = ObjectArray::FindObjectFast<UEFunction>("SwitchLevel", EClassCastFlags::Function);
 
 	// Some games don't have APlayerController::SwitchLevel(), so we replace it with APlayerController::FOV() which has the same FunctionFlags
-	if (SwitchLevel_Or_FOV == 0)
-		SwitchLevel_Or_FOV = reinterpret_cast<uintptr_t>(ObjectArray::FindObjectFast("FOV", EClassCastFlags::Function).GetAddress());
+	if (!SwitchLevel_Or_FOV)
+		SwitchLevel_Or_FOV = ObjectArray::FindObjectFast<UEFunction>("FOV", EClassCastFlags::Function);
 
-	for (int i = 0x30; i < 0x140; i += sizeof(void*))
+	if (!WasInputKeyJustPressed || !ToggleSpeaking || !SwitchLevel_Or_FOV)
 	{
-		if (Platform::IsAddressInProcessRange(*reinterpret_cast<uintptr_t*>(WasInputKeyJustPressed + i)) &&
-			Platform::IsAddressInProcessRange(*reinterpret_cast<uintptr_t*>(ToggleSpeaking + i)) && Platform::IsAddressInProcessRange(*reinterpret_cast<uintptr_t*>(SwitchLevel_Or_FOV + i)))
-			return i;
+		LogError("FindFunctionNativeFuncOffset: missing sample UFunction(s)");
+		return 0x0;
 	}
 
+	auto HasNativePointerAt = [](const UEFunction& Function, const int32_t Offset) -> bool
+	{
+		const uintptr_t Value = *reinterpret_cast<const uintptr_t*>(reinterpret_cast<uintptr_t>(Function.GetAddress()) + Offset);
+		return IsExecutableAddress(Value);
+	};
+
+	/* ExecFunction must point into executable memory.  Just checking the
+	 * process range would match heap pointers such as UStruct::Children at
+	 * +0x38 and report a bogus offset. */
+	for (int32_t i = 0x30; i < 0x140; i += sizeof(void*))
+	{
+		if (HasNativePointerAt(WasInputKeyJustPressed, i) &&
+			HasNativePointerAt(ToggleSpeaking, i) &&
+			HasNativePointerAt(SwitchLevel_Or_FOV, i))
+		{
+			return i;
+		}
+	}
+
+	LogError("FindFunctionNativeFuncOffset: no executable pointer found in UFunction");
 	return 0x0;
 }
 
