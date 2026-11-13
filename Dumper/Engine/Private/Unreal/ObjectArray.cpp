@@ -369,7 +369,7 @@ void ObjectArray::Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& Obj
 	GObjects = reinterpret_cast<uint8*>(GetModuleBase(ModuleName) + GObjectsOffset);
 	Off::InSDK::ObjArray::GObjects = GObjectsOffset;
 
-	LogInfo("GObjects: 0x%p", (void*)GObjects);
+	LogInfo("GObjects: %p", (void*)GObjects);
 
 	Off::FUObjectArray::bIsChunked = false;
 	Off::FUObjectArray::FixedLayout = ObjectArrayLayout.IsValid() ? ObjectArrayLayout : FFixedUObjectArrayLayouts[0];
