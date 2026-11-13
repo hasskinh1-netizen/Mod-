@@ -1,29 +1,34 @@
 #pragma once
-#include <vector>
-#include <string>
+#include <cstddef>
 #include <mutex>
-#include "../ImGui/imgui.h"
+#include <string>
+#include <vector>
 
-// Define Log Types
+// Log entry types map to the HUD badges:
+//   0 = INFO, 1 = ERR, 2 = OK
 struct Output {
     std::string text;
     std::string time;
-    int type; // 0=Log, 1=Error, 2=Success
+    int type;
 };
 
 class Console {
 public:
-    static Console& Get(); // Singleton accessor
+    static Console& Get();
 
     std::vector<Output> outputArr;
-    std::mutex logMutex;
+    mutable std::mutex logMutex;
     bool autoScroll = true;
     bool visible = true;
 
+    // -1 = ALL, 0 = INFO, 1 = ERR, 2 = OK
+    int filter = -1;
+
     void log(const std::string& text);
     void logError(const std::string& text);
-    void logInfo(const std::string& text); // Using for Success/Highlight
+    void logInfo(const std::string& text);
     void clearLogs();
-    
-    void Render(); // Call this in your ImGui loop
+
+    std::vector<Output> Snapshot() const;
+    size_t CountType(int type) const;
 };

@@ -27,7 +27,16 @@ static bool MenDeal = true;
     ImGuiStyle &style = ImGui::GetStyle();
 
     io.Fonts->Clear();
-    io.Fonts->AddFontDefault(); // replace with your own fonts
+
+    /* Rasterize ProggyClean above the HUD's largest text size so explicit
+     * AddText() sizes (8-16 pt) stay crisp on Retina panels.  ImGuiDrawView
+     * scales the default 12 pt UI font down every frame. */
+    ImFontConfig FontConfig;
+    FontConfig.SizePixels = 32.0f;
+    FontConfig.OversampleH = 1;
+    FontConfig.OversampleV = 1;
+    FontConfig.PixelSnapH = true;
+    io.Fonts->AddFontDefault(&FontConfig);
 
     ImGui_ImplMetal_Init(_device);
 
