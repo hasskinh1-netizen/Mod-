@@ -143,6 +143,9 @@ public:
 
 	static FNameEntry GetNameEntry(const void* Name);
 	static FNameEntry GetNameEntry(int32 Idx);
+
+	/* Live TNameEntryArray* / FNamePool* (after the per-game decryption chain). */
+	static void* DEBUGGetGNames() { return GNames; }
 };
 
 /* Convenience: pass a lambda and have its source captured automatically for SDK emission. */

@@ -1767,6 +1767,10 @@ void CppGenerator::Generate()
 	{
 		WriteFileEnd(DebugAssertions, EFileType::DebugAssertions);
 	}
+
+	/* PUBG extras: PUBGOffsets.hpp + the SDKGen-style companion files. */
+	DumpPUBGOffsetsHeader(MainFolder);
+	DumpSDKGenCompanionFiles(MainFolder);
 }
 
 void CppGenerator::InitPredefinedMembers()

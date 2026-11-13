@@ -85,6 +85,13 @@ namespace Settings
 		inline std::string GameName = "";
 		inline std::string GameVersion = "";
 
+		/* Populated from the host app's Info.plist (NSBundle).  These are used
+		 * instead of KismetSystemLibrary::GetGameName/GetEngineVersion on games
+		 * whose ProcessEvent ABI makes the reflected call return garbage. */
+		inline std::string BundleIdentifier = "";
+		inline std::string BundleDisplayName = "";
+		inline std::string BundleVersion = "";
+
 		inline std::string SDKGenerationPath = getenv("HOME") ? getenv("HOME") : "";
 	}
 
@@ -205,6 +212,11 @@ R"(
 		 * Needed on games where GObjects[0] is 'None' (both int32s are 0), which the
 		 * heuristic otherwise mistakes for WITH_CASE_PRESERVING_NAME + FNAME_OUTLINE_NUMBER. */
 		inline bool bForcedLegacyFNameLayout = false;
+
+		/* True when Generator::InitEngineCore() matched the PUBG Mobile profile
+		 * (GObjects/GNames signatures).  Enables PUBG-specific output files such
+		 * as PUBGOffsets.hpp and the SDKGen-style folder layout. */
+		inline bool bIsPUBGProfile = false;
 
 		/* Whether this game uses the 'FFieldPathProperty' cast flags for a custom property 'FObjectPtrProperty' */
 		inline bool bIsObjPtrInsteadOfFieldPathProperty = false;

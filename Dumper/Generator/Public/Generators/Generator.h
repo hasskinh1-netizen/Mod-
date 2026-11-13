@@ -13,6 +13,15 @@ namespace fs = std::filesystem;
 void DumpEditorOnlyMetadata(const fs::path& DumperFolder);
 void DumpUEOffsetsHeader(const fs::path& DumperFolder);
 
+/* PUBG Mobile extras.  DumpPUBGOffsetsHeader() resolves the macro table used
+ * by common PUBG cheat bases from the live SDK dump and writes PUBGOffsets.hpp. */
+void DumpPUBGOffsetsHeader(const fs::path& GameFolder);
+
+/* SDKGen-compatible companion files ("Offsets.txt", "LastStatus.txt",
+ * "BootLog.txt", "NamesDump.txt", "ObjectsDump.txt" and "dump.log").
+ * GameFolder is the per-game folder that contains SDK.hpp + SDK/. */
+void DumpSDKGenCompanionFiles(const fs::path& GameFolder);
+
 template<typename GeneratorType>
 concept GeneratorImplementation = requires(GeneratorType t)
 {

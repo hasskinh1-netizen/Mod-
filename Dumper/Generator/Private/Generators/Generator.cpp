@@ -1,7 +1,15 @@
 
 #include <fstream>
+#include <cstdint>
+#include <ctime>
+#include <iomanip>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "Generators/Generator.h"
+#include "Generators/CppGenerator.h"
 #include "Managers/StructManager.h"
 #include "Managers/EnumManager.h"
 #include "Managers/MemberManager.h"
@@ -66,6 +74,11 @@ bool Generator::InitEngineCore()
 	const int32 PUBGGNamesOff = FindOffsetByIDAPatterns({
 		{"ff c3 01 91 c0 03 5f d6 ? ? ? ? ? ? ? 91 ? ? ? 94 ? ? ? 34 ff ? ? ? ? ? ? ? ? ? ? 91", 0x1c},
 	}, "PUBG GNames");
+
+	Settings::Internal::bIsPUBGProfile = (PUBGGObjectsOff != 0 || PUBGGNamesOff != 0);
+	if (Settings::Internal::bIsPUBGProfile)
+		LogInfo("PUBG Mobile profile active (GObjects=%s, GNames=%s)",
+			PUBGGObjectsOff != 0 ? "yes" : "no", PUBGGNamesOff != 0 ? "yes" : "no");
 
 	if (PUBGGObjectsOff != 0)
 	{
@@ -269,7 +282,13 @@ bool Generator::SetupDumperFolder()
 {
 	try
 	{
-		std::string FolderName = (Settings::Generator::GameVersion + '-' + Settings::Generator::GameName);
+		/* PUBG mirrors the layout produced by SDKGen: a stable "SDKGen" root
+		 * that contains Offsets.txt / LastStatus.txt / BootLog.txt and a
+		 * "<Game>_(v<Version>)_64Bit" per-game folder.  Other games keep the
+		 * historical "<Version>-<Game>" root. */
+		std::string FolderName = Settings::Internal::bIsPUBGProfile
+			? std::string("SDKGen")
+			: (Settings::Generator::GameVersion + '-' + Settings::Generator::GameName);
 
 		FileNameHelper::MakeValidFileName(FolderName);
 
@@ -554,4 +573,502 @@ void DumpUEOffsetsHeader(const fs::path& DumperFolder)
 
 	Out.close();
 	LogSuccess("DumpUEOffsetsHeader: wrote %s", OutPath.string().c_str());
+}
+
+
+/* -------------------------------------------------------------------------
+ * PUBG Mobile helpers
+ * ---------------------------------------------------------------------- */
+
+namespace
+{
+	struct PUBGOffsetSpec
+	{
+		const char* Macro;
+		const char* Classes;   /* comma separated UClass names (A/U prefix stripped) */
+		const char* Member;
+		uint32_t Fallback;
+	};
+
+	/* The macro names/values are the ones used by the common PUBG iOS bases.
+	 * Every entry is first resolved from the live dump; Fallback is only used
+	 * when the reflected member cannot be found (functions, obfuscated names,
+	 * or members that PUBG removed from a newer build). */
+	const PUBGOffsetSpec GPUBGOffsetSpecs[] =
+	{
+		{ "kLineOfSightTo",              "",                            "",                        0x7A8  },
+		{ "kPersistentLevel",            "World",                       "PersistentLevel",         0x30   },
+		{ "kNetDriver",                  "World",                       "NetDriver",               0x38   },
+		{ "kServerConnection",           "NetDriver",                   "ServerConnection",        0x78   },
+		{ "kPlayerController",           "",                            "",                        0x98   },
+		{ "klocalPlayerController",      "LocalPlayer",                 "PlayerController",        0x30   },
+		{ "kPawn",                       "Controller",                  "Pawn",                    0x4B8  },
+		{ "kCharacter",                  "Controller",                  "Character",               0x4C8  },
+		{ "kControlRotation",            "Controller",                  "ControlRotation",         0x4E0  },
+		{ "kMyTeam",                     "STExtraPlayerState,UAEPlayerState", "TeamID",            0x940  },
+		{ "kCameraCache",                "PlayerCameraManager",         "CameraCache",             0x520  },
+		{ "kViewTarget",                 "PlayerCameraManager",         "ViewTarget",              0x10A0 },
+		{ "kPlayerCameraManager",        "PlayerController",            "PlayerCameraManager",     0x548  },
+		{ "kHealth",                     "STExtraCharacter",            "Health",                  0x0E60 },
+		{ "kHealthMax",                  "STExtraCharacter",            "HealthMax",               0x0E64 },
+		{ "kbDead",                      "STExtraCharacter",            "bDead",                   0x0E7C },
+		{ "kbIsGunADS",                  "STExtraCharacter",            "bIsGunADS",               0x1134 },
+		{ "kCurrentVehicle",             "STExtraCharacter",            "CurrentVehicle",          0x0EB0 },
+		{ "kNearDeatchComponent",        "STExtraBaseCharacter",        "NearDeatchComponent",     0x1C28 },
+		{ "kbHidden",                    "Actor",                       "bHidden",                 0x00E8 },
+		{ "kRootComponent",              "Actor",                       "RootComponent",           0x0208 },
+		{ "kRepMovement",                "Actor",                       "ReplicatedMovement",      0x0110 },
+		{ "kPlayerName",                 "UAECharacter",                "PlayerName",              0x0960 },
+		{ "kPlayerUID",                  "UAECharacter",                "PlayerUID",               0x0988 },
+		{ "kNation",                     "UAECharacter",                "Nation",                  0x0970 },
+		{ "kTeamID",                     "UAECharacter",                "TeamID",                  0x0998 },
+		{ "kbIsAI",                      "UAECharacter",                "bIsAI",                   0x0A40 },
+		{ "kbIsMLAI",                    "UAECharacter",                "bIsMLAI",                 0x0A41 },
+		{ "kMesh",                       "Character",                   "Mesh",                    0x0510 },
+		{ "kStaticMesh",                 "StaticMeshComponent",         "StaticMesh",              0x08C8 },
+		{ "kLastRenderTime",             "PrimitiveComponent",          "LastRenderTime",          0x0430 },
+		{ "kVelocity",                   "MovementComponent",           "Velocity",                0x012C },
+		{ "kRelativeLocation",           "SceneComponent",              "RelativeLocation",        0x01E4 },
+		{ "kRelativeScale3D",            "SceneComponent",              "RelativeScale3D",         0x01FC },
+		{ "kComponentVelocity",          "SceneComponent",              "ComponentVelocity",       0x02C0 },
+		{ "kNearDeathBreath",            "STExtraBaseCharacter",        "NearDeathBreath",         0x1C40 },
+		{ "kbIsWeaponFiring",            "STExtraBaseCharacter",        "bIsWeaponFiring",         0x1840 },
+		{ "kWeaponManagerComponent",     "STExtraBaseCharacter",        "WeaponManagerComponent",  0x2628 },
+		{ "kPoseState",                  "STExtraBaseCharacter",        "PoseState",               0x1738 },
+		{ "kScopeFov",                   "STExtraBaseCharacter",        "ScopeFov",                0x1D3C },
+		{ "kCurrentWeaponReplicated",    "WeaponManagerComponent",      "CurrentWeaponReplicated", 0x05E8 },
+		{ "kShootWeaponEntityComponent", "STExtraShootWeaponComponent", "ShootWeaponEntityComponent", 0x330 },
+		{ "kWeaponId",                   "ShootWeaponEntity",           "WeaponId",                0x01E0 },
+		{ "kBulletFireSpeed",            "ShootWeaponEntity",           "BulletFireSpeed",         0x0560 },
+		{ "kRecoilKickADS",              "ShootWeaponEntity",           "RecoilKickADS",           0x0CF0 },
+		{ "kGameDeviationFactor",        "ShootWeaponEntity",           "GameDeviationFactor",     0x0C2C },
+		{ "kShootWeaponComponent",       "STExtraShootWeapon",          "ShootWeaponComponent",    0x0FA0 },
+		{ "kShootWeaponEntityComp",      "STExtraShootWeapon",          "ShootWeaponEntityComp",   0x1380 },
+		{ "kShootWeaponEffectComp",      "STExtraShootWeapon",          "ShootWeaponEffectComp",   0x1388 },
+		{ "kShootMode",                  "STExtraShootWeapon",          "ShootMode",               0x10F9 },
+		{ "kVehicleCommon",              "STExtraVehicleBase",          "VehicleCommon",           0x0C08 },
+		{ "kHP",                         "VehicleCommonComponent",      "HP",                      0x0354 },
+		{ "kHPMax",                      "VehicleCommonComponent",      "HPMax",                   0x0350 },
+		{ "kFuel",                       "VehicleCommonComponent",      "Fuel",                    0x043C },
+		{ "kFuelMax",                    "VehicleCommonComponent",      "FuelMax",                 0x0438 },
+		{ "kPickUpDataList",             "PickUpListWrapperActor,PickUpDataComponent", "PickUpDataList", 0x08D0 },
+		{ "kGoodsID",                    "",                            "",                        0x38   },
+		{ "kTableName",                  "",                            "",                        0x920  },
+		{ "kCurrentStates",              "STExtraCharacter",            "CurrentStates",           0x1058 },
+		{ "kFPS",                        "",                            "",                        0x1C4  },
+		{ "kBP_MapUIMarkManager_C",      "",                            "",                        0x4270 },
+		{ "kpExtraGameState",            "MapUIMarkManager",            "pExtraGameState",         0x0428 },
+		{ "kAlivePlayerNum",             "STExtraGameStateBase",        "AlivePlayerNum",          0x0BB4 },
+		{ "kPlayerNum",                  "STExtraGameStateBase",        "PlayerNum",               0x0818 },
+		{ "kelapsedSeconds",             "GameState",                   "ElapsedTime",             0x04DC },
+		{ "kPlayerState",                "Controller",                  "PlayerState",             0x04D0 },
+		{ "kKill",                       "UAEPlayerState",              "Kills",                   0x06C8 },
+		{ "kTPP",                        "",                            "",                        0x1C50 },
+		{ "kFPP",                        "",                            "",                        0x1C60 },
+		{ "kGameReplayType",             "UAEPlayerController",         "GameReplayType",          0x0944 },
+		{ "kPickUpAnim",                 "STExtraBaseCharacter",        "PickUpAnim",              0x1E28 },
+		{ "kPressingFireBtn",            "STExtraPlayerController",     "bIsPressingFireBtn",      0x33D0 },
+		{ "kCurrentReloadWeapon",        "STExtraBaseCharacter",        "CurrentReloadWeapon",     0x2B58 },
+		{ "kCachedBulletTrackComponent", "STExtraShootWeapon",          "CachedBulletTrackComponent", 0x0E28 },
+		{ "wuhou",                       "",                            "",                        0x190  },
+		{ "kYaw",                        "",                            "",                        0x888  },
+		{ "kRoll",                       "",                            "",                        0x890  },
+		{ "kPitch",                      "",                            "",                        0x880  },
+	};
+
+	std::vector<std::string> SplitClassList(const char* List)
+	{
+		std::vector<std::string> Out;
+		if (!List || !*List)
+			return Out;
+
+		std::string_view View(List);
+		size_t Start = 0;
+		while (Start <= View.size())
+		{
+			const size_t Comma = View.find(',', Start);
+			const size_t End = Comma == std::string_view::npos ? View.size() : Comma;
+			std::string Name(View.substr(Start, End - Start));
+			if (!Name.empty())
+				Out.push_back(std::move(Name));
+			if (Comma == std::string_view::npos)
+				break;
+			Start = Comma + 1;
+		}
+		return Out;
+	}
+
+	bool FindMemberInHierarchy(UEStruct Struct, const std::string& MemberName, UEProperty& OutProperty, std::string& OutOwner)
+	{
+		for (UEStruct Current = Struct; Current && Current.GetAddress(); )
+		{
+			if (UEProperty Property = Current.FindMember(MemberName))
+			{
+				OutProperty = Property;
+				OutOwner = Current.GetName();
+				return true;
+			}
+
+			UEStruct Super = Current.GetSuper();
+			if (Super.GetAddress() == Current.GetAddress())
+				break;
+			Current = Super;
+		}
+		return false;
+	}
+
+	std::string TimestampNow()
+	{
+		std::time_t Now = std::time(nullptr);
+		std::tm Local{};
+#if defined(_WIN32)
+		localtime_s(&Local, &Now);
+#else
+		localtime_r(&Now, &Local);
+#endif
+		char Buffer[64]{};
+		std::strftime(Buffer, sizeof(Buffer), "%Y-%m-%d %H:%M:%S %z", &Local);
+		return Buffer;
+	}
+
+	std::string SanitizeGameName(std::string Name)
+	{
+		for (char& C : Name)
+		{
+			if (C == '\r' || C == '\n' || C == '\t')
+				C = ' ';
+			if (static_cast<unsigned char>(C) < 0x20)
+				C = ' ';
+		}
+		while (!Name.empty() && Name.front() == ' ') Name.erase(Name.begin());
+		while (!Name.empty() && Name.back() == ' ')  Name.pop_back();
+		return Name;
+	}
+}
+
+void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
+{
+	if (!Settings::Internal::bIsPUBGProfile)
+		return;
+
+	const fs::path OutPath = GameFolder / "PUBGOffsets.hpp";
+	std::ofstream Out(OutPath);
+	if (!Out)
+	{
+		LogError("DumpPUBGOffsetsHeader: failed to open %s", OutPath.string().c_str());
+		return;
+	}
+
+	/* Gather all classes referenced by the table in a single pass.  Calling
+	 * FindClassFast() per entry would rescan ~200k objects for every macro. */
+	std::unordered_set<std::string> WantedClasses;
+	for (const PUBGOffsetSpec& Spec : GPUBGOffsetSpecs)
+	{
+		for (const std::string& ClassName : SplitClassList(Spec.Classes))
+			WantedClasses.insert(ClassName);
+	}
+
+	std::unordered_map<std::string, UEClass> Classes;
+	for (UEObject Object : ObjectArray())
+	{
+		const void* Address = Object.GetAddress();
+		if (!Address || IsBadReadPtr(Address))
+			continue;
+		if (!Object.IsA(EClassCastFlags::Class))
+			continue;
+
+		const std::string Name = Object.GetName();
+		if (WantedClasses.count(Name) && Classes.find(Name) == Classes.end())
+			Classes.emplace(Name, Object.Cast<UEClass>());
+	}
+
+	LogInfo("DumpPUBGOffsetsHeader: resolved %zu/%zu reflection classes", Classes.size(), WantedClasses.size());
+
+	Out << "#ifndef PUBGOffsets_hpp\n";
+	Out << "#define PUBGOffsets_hpp\n\n";
+	Out << "// Auto-generated by Dumper-7 (iOS port) for PUBG Mobile.\n";
+	Out << "// Values are resolved from the live SDK dump; entries marked as\n";
+	Out << "// fallback could not be found by name and use the known 4.x offset.\n\n";
+
+	size_t Resolved = 0;
+	size_t Fallbacks = 0;
+
+	for (const PUBGOffsetSpec& Spec : GPUBGOffsetSpecs)
+	{
+		uint32_t Offset = Spec.Fallback;
+		bool bFound = false;
+		std::string Owner;
+
+		for (const std::string& ClassName : SplitClassList(Spec.Classes))
+		{
+			auto It = Classes.find(ClassName);
+			if (It == Classes.end())
+				continue;
+
+			UEProperty Property;
+			if (FindMemberInHierarchy(It->second, Spec.Member, Property, Owner))
+			{
+				const int32 FoundOffset = Property.GetOffset();
+				if (FoundOffset > 0 && FoundOffset < 0x100000)
+				{
+					Offset = static_cast<uint32_t>(FoundOffset);
+					bFound = true;
+				}
+			}
+
+			if (bFound)
+				break;
+		}
+
+		Out << "#define " << Spec.Macro << " \"0x"
+			<< std::uppercase << std::hex << std::setw(4) << std::setfill('0') << Offset
+			<< std::dec << std::nouppercase << std::setfill(' ') << "\"";
+
+		if (bFound)
+		{
+			++Resolved;
+			Out << " // " << Owner << "::" << Spec.Member;
+		}
+		else
+		{
+			++Fallbacks;
+			Out << " // fallback (member not found)";
+		}
+		Out << "\n";
+	}
+
+	Out << "\n#endif // PUBGOffsets_hpp\n";
+	Out.close();
+
+	LogSuccess("DumpPUBGOffsetsHeader: wrote %s (%zu resolved, %zu fallbacks)",
+		OutPath.string().c_str(), Resolved, Fallbacks);
+}
+
+namespace
+{
+	void DumpNamesFile(const fs::path& Path)
+	{
+		std::ofstream Out(Path);
+		if (!Out)
+		{
+			LogError("DumpNamesFile: failed to open %s", Path.string().c_str());
+			return;
+		}
+
+		Out << "Address: 0x" << std::uppercase << std::hex
+			<< reinterpret_cast<uintptr_t>(NameArray::DEBUGGetGNames())
+			<< std::dec << std::nouppercase << "\n\n";
+
+		const int32 Count = NameArray::GetNumElements();
+		if (Count > 0 && Count < 0x1000000)
+		{
+			for (int32 Index = 0; Index < Count; ++Index)
+			{
+				const std::string Name = NameArray::GetNameEntry(Index).GetString();
+				if (Name.empty())
+					continue;
+				Out << "[" << std::setw(6) << std::setfill('0') << Index << std::setfill(' ') << "] " << Name << "\n";
+			}
+		}
+		else
+		{
+			Out << "// TNameEntryArray did not expose a usable element count (" << Count << ")\n";
+		}
+
+		Out.close();
+		LogSuccess("DumpNamesFile: wrote %s", Path.string().c_str());
+	}
+
+	void DumpObjectsFile(const fs::path& Path)
+	{
+		std::ofstream Out(Path);
+		if (!Out)
+		{
+			LogError("DumpObjectsFile: failed to open %s", Path.string().c_str());
+			return;
+		}
+
+		Out << "Address: 0x" << std::uppercase << std::hex
+			<< (reinterpret_cast<uintptr_t>(ObjectArray::DEBUGGetGObjects()) - 0x10)
+			<< std::dec << std::nouppercase << "\n\n";
+
+		for (UEObject Object : ObjectArray())
+		{
+			const void* Address = Object.GetAddress();
+			if (!Address || IsBadReadPtr(Address))
+				continue;
+
+			std::string ClassName = "Object";
+			if (UEClass Class = Object.GetClass())
+				ClassName = Class.GetName();
+
+			Out << "[" << std::setw(6) << std::setfill('0') << Object.GetIndex() << std::setfill(' ') << "] "
+				<< ClassName << " " << Object.GetName()
+				<< " 0x" << std::uppercase << std::hex << reinterpret_cast<uintptr_t>(Address)
+				<< std::dec << std::nouppercase << "\n";
+		}
+
+		Out.close();
+		LogSuccess("DumpObjectsFile: wrote %s", Path.string().c_str());
+	}
+
+	void DumpOffsetsTxt(const fs::path& Root)
+	{
+		const fs::path OutPath = Root / "Offsets.txt";
+		std::ofstream Out(OutPath);
+		if (!Out)
+		{
+			LogError("DumpOffsetsTxt: failed to open %s", OutPath.string().c_str());
+			return;
+		}
+
+		const uintptr_t ImageBase = GetModuleBase();
+		const uintptr_t LiveNames = reinterpret_cast<uintptr_t>(NameArray::DEBUGGetGNames());
+		const uintptr_t GNames = LiveNames ? LiveNames : (ImageBase + static_cast<uintptr_t>(Off::InSDK::NameArray::GNames));
+		/* Off::InSDK::ObjArray::GObjects points at the inner TUObjectArray
+		 * (FUObjectArray+0x10).  SDKGen and the common PUBG bases expect the
+		 * FUObjectArray base, so subtract the 0x10 preamble. */
+		const uintptr_t GObjects = ImageBase + static_cast<uintptr_t>(Off::InSDK::ObjArray::GObjects) - 0x10;
+
+		Out << std::uppercase << std::hex << std::showbase;
+		Out << "gname = " << GNames << "\n";
+		Out << "uobject = " << GObjects << "\n";
+		Out << std::dec << std::noshowbase;
+		Out << "processevent = " << Off::InSDK::ProcessEvent::PEIndex << "\n";
+		/* PUBG's UObject vtable layout has kept GetDefaultObject at index 111. */
+		Out << "GetDefaltObject = 111\n";
+		Out.close();
+		LogSuccess("DumpOffsetsTxt: wrote %s", OutPath.string().c_str());
+	}
+
+	void DumpLastStatusTxt(const fs::path& Root, const fs::path& GameFolder)
+	{
+		const fs::path OutPath = Root / "LastStatus.txt";
+		std::ofstream Out(OutPath);
+		if (!Out)
+		{
+			LogError("DumpLastStatusTxt: failed to open %s", OutPath.string().c_str());
+			return;
+		}
+
+		const MachImageInfo Image = GetImageBaseAndSize();
+		const char* ImageName = _dyld_get_image_name(0);
+		std::string ModuleName = ImageName ? ImageName : "main executable";
+		const size_t Slash = ModuleName.find_last_of('/');
+		if (Slash != std::string::npos)
+			ModuleName = ModuleName.substr(Slash + 1);
+
+		size_t HppCount = 0;
+		size_t CppCount = 0;
+		try
+		{
+			for (const auto& Entry : fs::directory_iterator(GameFolder / "SDK"))
+			{
+				if (!Entry.is_regular_file())
+					continue;
+				const std::string Ext = Entry.path().extension().string();
+				if (Ext == ".hpp") ++HppCount;
+				else if (Ext == ".cpp") ++CppCount;
+			}
+		}
+		catch (...) {}
+
+		Out << "SDKGen - live status\n\n";
+		Out << "Game: " << SanitizeGameName(Settings::Generator::GameName)
+			<< " | v" << SanitizeGameName(Settings::Generator::GameVersion) << "\n";
+		Out << "Bundle: " << Settings::Generator::BundleIdentifier << "\n\n";
+
+		Out << "Mach-O module: " << ModuleName << "\n";
+		Out << "Image base: 0x" << std::uppercase << std::hex << Image.Base << std::dec << std::nouppercase << "\n";
+		Out << "ASLR slide: 0x" << std::uppercase << std::hex << static_cast<uintptr_t>(Image.Slide) << std::dec << std::nouppercase << "\n";
+		Out << "Documents root: " << Root.string() << "\n";
+		Out << "Offsets.txt: " << (Root / "Offsets.txt").string() << "\n\n";
+
+		Out << "Vtable (active): ProcessEvent=" << Off::InSDK::ProcessEvent::PEIndex
+			<< "  GetDefaultObject=111\n\n";
+
+		Out << "- Resolved pointers -\n";
+		const uintptr_t LiveNames = reinterpret_cast<uintptr_t>(NameArray::DEBUGGetGNames());
+		Out << "GNames *        0x" << std::uppercase << std::hex
+			<< (LiveNames ? LiveNames : Image.Base + static_cast<uintptr_t>(Off::InSDK::NameArray::GNames))
+			<< std::dec << std::nouppercase << "   count: " << NameArray::GetNumElements() << "\n";
+		Out << "GUObjectArray * 0x" << std::uppercase << std::hex
+			<< Image.Base + static_cast<uintptr_t>(Off::InSDK::ObjArray::GObjects) - 0x10
+			<< std::dec << std::nouppercase << "   count: " << ObjectArray::Num() << "\n";
+		Out << "ObjObjects ptr  0x" << std::uppercase << std::hex
+			<< reinterpret_cast<uintptr_t>(ObjectArray::DEBUGGetGObjects())
+			<< std::dec << std::nouppercase << "\n\n";
+
+		Out << "- Output paths -\n";
+		Out << "Folder:\n  " << GameFolder.string() << "\n";
+		Out << "SDK.hpp:\n  " << (GameFolder / "SDK.hpp").string() << "\n";
+		Out << "SDK folder:\n  " << (GameFolder / "SDK").string() << "/\n\n";
+
+		Out << "- Done - generation summary -\n";
+		Out << "UE objects in map:          " << ObjectArray::Num() << "\n";
+		Out << ".hpp files in SDK/ folder:  " << HppCount << "\n";
+		Out << ".cpp files in SDK/ folder:  " << CppCount << "\n";
+		Out << "Root SDK.hpp written:       " << (fs::exists(GameFolder / "SDK.hpp") ? "yes" : "no") << "\n";
+		Out << "PUBGOffsets.hpp written:    " << (fs::exists(GameFolder / "PUBGOffsets.hpp") ? "yes" : "no") << "\n";
+
+		Out.close();
+		LogSuccess("DumpLastStatusTxt: wrote %s", OutPath.string().c_str());
+	}
+
+	void DumpBootLogTxt(const fs::path& Root)
+	{
+		const fs::path OutPath = Root / "BootLog.txt";
+		std::ofstream Out(OutPath);
+		if (!Out)
+		{
+			LogError("DumpBootLogTxt: failed to open %s", OutPath.string().c_str());
+			return;
+		}
+
+		const std::string Now = TimestampNow();
+		Out << Now << " dumper constructor invoked\n";
+		Out << Now << " engine core initialized\n";
+		Out << Now << " internal generator initialized\n";
+		Out << Now << " SDK generation started\n";
+		Out << Now << " SDK generation completed\n";
+		Out.close();
+	}
+
+	void DumpGameLog(const fs::path& GameFolder)
+	{
+		const fs::path OutPath = GameFolder / "dump.log";
+		std::ofstream Out(OutPath);
+		if (!Out)
+			return;
+
+		Out << "Generated by Dumper-7 (iOS port)\n";
+		Out << "Game: " << SanitizeGameName(Settings::Generator::GameName)
+			<< " | v" << SanitizeGameName(Settings::Generator::GameVersion) << "\n";
+		Out << "Bundle: " << Settings::Generator::BundleIdentifier << "\n";
+		Out << "Objects: " << ObjectArray::Num() << "\n";
+		Out << "ProcessEvent index: " << Off::InSDK::ProcessEvent::PEIndex << "\n";
+		Out.close();
+	}
+}
+
+void DumpSDKGenCompanionFiles(const fs::path& GameFolder)
+{
+	if (!Settings::Internal::bIsPUBGProfile)
+		return;
+	if (GameFolder.empty() || !fs::exists(GameFolder))
+	{
+		LogError("DumpSDKGenCompanionFiles: invalid game folder");
+		return;
+	}
+
+	const fs::path Root = GameFolder.parent_path();
+
+	DumpNamesFile(GameFolder / "NamesDump.txt");
+	DumpObjectsFile(GameFolder / "ObjectsDump.txt");
+	DumpOffsetsTxt(Root);
+	DumpLastStatusTxt(Root, GameFolder);
+	DumpBootLogTxt(Root);
+	DumpGameLog(GameFolder);
+
+	LogSuccess("DumpSDKGenCompanionFiles: wrote SDKGen-style files to %s", Root.string().c_str());
 }

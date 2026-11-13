@@ -62,7 +62,7 @@ void Off::InSDK::ProcessEvent::InitPE(const int32 Index, const char* const Modul
 /* UWorld */
 void Off::InSDK::World::InitGWorld()
 {
-	LogInfo("InitGWorld: searching for UWorld** GWorld via in-process scan...");
+	LogInfo("InitGWorld: searching for UWorld** GWorld via data-segment scan...");
 
 	UEClass UWorld = ObjectArray::FindClassFast("World");
 	if (!UWorld)
@@ -71,59 +71,130 @@ void Off::InSDK::World::InitGWorld()
 		return;
 	}
 
-	for (UEObject Obj : ObjectArray())
+	/* Scan only the module's writable data segments.  The old implementation
+	 * walked every Mach-O segment (including __PAGEZERO and unmapped ranges),
+	 * which is both slow and unreliable on iOS 15+.  Every 8-byte slot is
+	 * checked so an unstable hit (e.g. GActiveLogWorld) doesn't hide the real
+	 * GWorld slot that follows it. */
+	auto FindPointerInSegments = [](uintptr_t Target) -> void*
 	{
-		if (Obj.HasAnyFlags(EObjectFlags::ClassDefaultObject) || !Obj.IsA(UWorld))
-			continue;
-
-		/* Try to find a pointer to the word, aka UWorld** GWorld */
-		auto Results = Platform::FindAllAlignedValuesInProcess(Obj.GetAddress());
-
-		void* Result = nullptr;
-		if (Results.size())
+		const char* const Segments[] = { "__DATA", "__DATA_DIRTY", "__DATA_CONST" };
+		for (const char* Segment : Segments)
 		{
-			if (Results.size() == 1)
-			{
-				Result = Results[0];
-			}
-			else if (Results.size() == 2)
-			{
-				auto ObjAddress = reinterpret_cast<uintptr_t>(Obj.GetAddress());
-				auto PossibleGWorld = reinterpret_cast<volatile uintptr_t*>(Results[0]);
-				auto CurrentValue = *PossibleGWorld;
+			SectionInfo Info = Platform::GetSectionInfo(Segment);
+			if (!Info.IsValid())
+				continue;
 
-				for (int i = 0; CurrentValue == ObjAddress && i < 50; ++i)
-				{
-					std::this_thread::sleep_for(std::chrono::milliseconds(1));
-					CurrentValue = *PossibleGWorld;
-				}
-				if (CurrentValue == ObjAddress)
-				{
-					Result = Results[0];
-				}
-				else
-				{
-					Result = Results[1];
-					LogInfo("InitGWorld: filtered out GActiveLogWorld at 0x%lX", reinterpret_cast<uintptr_t>(PossibleGWorld));
-				}
-			}
-			else
+			void* Result = nullptr;
+			Platform::IterateSectionWithCallback(Info, [&](void* Address) -> bool
 			{
-				LogError("InitGWorld: ambiguous - found %zu candidate GWorld pointers", Results.size());
+				if (*reinterpret_cast<uintptr_t*>(Address) != Target)
+					return false;
+
+				/* GWorld is stable; GActiveLogWorld changes while loading. */
+				volatile uintptr_t* Slot = reinterpret_cast<volatile uintptr_t*>(Address);
+				const uintptr_t First = *Slot;
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				const uintptr_t Second = *Slot;
+				if (First != Target || Second != Target)
+					return false;
+
+				Result = Address;
+				return true;
+			}, alignof(uintptr_t));
+
+			if (Result)
+			{
+				LogInfo("InitGWorld: pointer candidate in %s at 0x%lX", Segment, reinterpret_cast<uintptr_t>(Result));
+				return Result;
 			}
 		}
+		return nullptr;
+	};
 
-		/* Pointer to UWorld* couldn't be found */
-		if (Result)
+	/* Preferred source: the live GameViewport's World.  This is exactly what
+	 * the generated UWorld::GetWorld() falls back to, so a stable slot for it
+	 * is guaranteed to track map changes. */
+	uintptr_t ViewportWorld = 0;
+	{
+		UEClass UEngine = ObjectArray::FindClassFast("Engine");
+		UEClass UGameViewportClient = ObjectArray::FindClassFast("GameViewportClient");
+		if (UEngine && UGameViewportClient)
 		{
-			Off::InSDK::World::GWorld = Platform::GetOffset(Result);
-			LogSuccess("InitGWorld: GWorld-Offset = 0x%X", Off::InSDK::World::GWorld);
-			break;
+			UEProperty GameViewportProp = UEngine.FindMember("GameViewport");
+			UEProperty WorldProp = UGameViewportClient.FindMember("World");
+
+			if (GameViewportProp && WorldProp)
+			{
+				for (UEObject Obj : ObjectArray())
+				{
+					const void* Address = Obj.GetAddress();
+					if (!Address || IsBadReadPtr(Address))
+						continue;
+					if (Obj.HasAnyFlags(EObjectFlags::ClassDefaultObject) || !Obj.IsA(UEngine))
+						continue;
+
+					uint8* Engine = reinterpret_cast<uint8*>(Obj.GetAddress());
+					uintptr_t GameViewport = *reinterpret_cast<uintptr_t*>(Engine + GameViewportProp.GetOffset());
+					if (!GameViewport || IsBadReadPtr(GameViewport))
+						continue;
+
+					uintptr_t WorldPtr = *reinterpret_cast<uintptr_t*>(GameViewport + WorldProp.GetOffset());
+					if (!WorldPtr || IsBadReadPtr(WorldPtr))
+						continue;
+
+					ViewportWorld = WorldPtr;
+					LogInfo("InitGWorld: UEngine::GameViewport->World = 0x%lX", WorldPtr);
+					break;
+				}
+			}
 		}
 	}
 
-	if (Off::InSDK::World::GWorld == 0x0)
-		LogError("InitGWorld: GWorld not found");
+	if (ViewportWorld != 0)
+	{
+		if (void* Found = FindPointerInSegments(ViewportWorld))
+		{
+			Off::InSDK::World::GWorld = Platform::GetOffset(Found);
+			LogSuccess("InitGWorld: GWorld-Offset = 0x%X (via GameViewport)", Off::InSDK::World::GWorld);
+			return;
+		}
+	}
+
+	/* Fall back to any live UWorld instance (bounded to keep the scan quick). */
+	std::vector<UEObject> Worlds;
+	for (UEObject Obj : ObjectArray())
+	{
+		const void* Address = Obj.GetAddress();
+		if (!Address || IsBadReadPtr(Address))
+			continue;
+		if (Obj.HasAnyFlags(EObjectFlags::ClassDefaultObject) || !Obj.IsA(UWorld))
+			continue;
+
+		if (reinterpret_cast<uintptr_t>(Address) == ViewportWorld)
+			continue;
+
+		Worlds.push_back(Obj);
+		if (Worlds.size() >= 4)
+			break;
+	}
+
+	LogInfo("InitGWorld: found %zu additional live UWorld instance(s)", Worlds.size());
+
+	for (UEObject World : Worlds)
+	{
+		const uintptr_t WorldAddress = reinterpret_cast<uintptr_t>(World.GetAddress());
+		if (void* Found = FindPointerInSegments(WorldAddress))
+		{
+			Off::InSDK::World::GWorld = Platform::GetOffset(Found);
+			LogSuccess("InitGWorld: GWorld-Offset = 0x%X", Off::InSDK::World::GWorld);
+			return;
+		}
+	}
+
+	/* Not fatal: the generated UWorld::GetWorld() falls back to
+	 * UEngine::GameViewport->World when Offsets::GWorld is zero. */
+	LogInfo("InitGWorld: no stable GWorld slot found; SDK will use UEngine::GameViewport->World");
 }
 
 /* FText */
