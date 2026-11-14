@@ -17,6 +17,12 @@ void DumpUEOffsetsHeader(const fs::path& DumperFolder);
  * by common PUBG cheat bases from the live SDK dump and writes PUBGOffsets.hpp. */
 void DumpPUBGOffsetsHeader(const fs::path& GameFolder);
 
+/* PUBG Mobile extras.  DumpPUBGReportFunctions() scans the live UObject array
+ * for UFunction objects related to reports/complaints/anti-cheat and writes
+ * PUBGReportFunctions.txt plus PUBGReportFunctions.hpp with unslid offsets and
+ * any resolvable native vtable slot. */
+void DumpPUBGReportFunctions(const fs::path& GameFolder);
+
 /* SDKGen-compatible companion files ("Offsets.txt", "LastStatus.txt",
  * "BootLog.txt", "NamesDump.txt", "ObjectsDump.txt" and "dump.log").
  * GameFolder is the per-game folder that contains SDK.hpp + SDK/. */

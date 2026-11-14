@@ -1,5 +1,7 @@
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <fstream>
 #include <cstdint>
 #include <ctime>
@@ -7,6 +9,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "Generators/Generator.h"
@@ -1383,6 +1386,422 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 
 	LogSuccess("DumpPUBGOffsetsHeader: wrote %s (%zu resolved, %zu candidates, %zu vtable, %zu manual, %zu fallbacks)",
 		OutPath.string().c_str(), Resolved, Candidates, VTableOffsets, Manual, Fallbacks);
+}
+
+namespace
+{
+	struct FReportFunctionEntry
+	{
+		std::string ClassName;
+		std::string FunctionName;
+		std::string FullName;
+		std::string Flags;
+		std::string Params;
+		const char* Net = "None";
+		uintptr_t ExecAddress = 0;
+		uintptr_t Rva = 0;
+		uintptr_t Unslid = 0;
+		uint32_t VTableOffset = UINT32_MAX;
+		const char* VTableVia = nullptr;
+		bool bNative = false;
+		bool bKey = false;
+	};
+
+	bool IsReportRelatedText(const std::string& LowerText)
+	{
+		static const char* Tokens[] =
+		{
+			"report", "complaint", "anticheat", "anti_cheat", "anti-cheat", "reporter"
+		};
+
+		for (const char* Token : Tokens)
+		{
+			if (LowerText.find(Token) != std::string::npos)
+				return true;
+		}
+		return false;
+	}
+
+	bool StartsWith(const std::string& Value, const char* Prefix)
+	{
+		const size_t Length = std::strlen(Prefix);
+		return Value.size() >= Length && Value.compare(0, Length, Prefix) == 0;
+	}
+
+	bool IsKeyReportFunction(const std::string& FunctionName)
+	{
+		static const char* Keys[] =
+		{
+			"ServerReportWatchGamePlayerInfoButtonClick",
+			"ServerReportNetCullDeviceGrade",
+			"ServerReportVehicleDrag",
+			"ServerReportProtection",
+			"ServerReportOpPanelExceptionData",
+			"ServerReportExceptionData",
+			"ServerReportAudioDebugData",
+			"ReportAntiCheatInfo",
+			"ReportAntiCheatDetailData",
+			"RPC_Client_ReportPlayerKillFlow",
+			"ReportPlayerKillFlow",
+			"CacheReportComplaintName",
+			"ResetReportComplaintNames",
+			"OnClientReportPeerVisualFieldActorList",
+			"RPC_Server_ReportUInt8ArrayReliable",
+			"RPC_Server_ReportUInt8ArrayUnreliable",
+			"RPC_Server_ReportIntArrayReliable",
+			"RPC_Server_ReportIntArrayUnreliable",
+			"RPC_Server_ReportFloatArrayReliable",
+			"RPC_Server_ReportFloatArrayUnreliable",
+			"ReportUInt8ArrayData",
+			"ReportIntArrayData",
+			"ReportFloatArrayData"
+		};
+
+		for (const char* Key : Keys)
+		{
+			if (FunctionName == Key)
+				return true;
+		}
+
+		/* Names drift between PUBG builds; keep the stable prefixes instead of
+		 * depending only on the exact 4.7 spellings above. */
+		return StartsWith(FunctionName, "ServerReport")
+			|| StartsWith(FunctionName, "RPC_Server_Report")
+			|| StartsWith(FunctionName, "RPC_Client_Report")
+			|| StartsWith(FunctionName, "OnClientReportPeerVisualField")
+			|| StartsWith(FunctionName, "ReportAntiCheat")
+			|| StartsWith(FunctionName, "CatchReportAntiCheat")
+			|| StartsWith(FunctionName, "CacheReportComplaint")
+			|| StartsWith(FunctionName, "ResetReportComplaint")
+			|| FunctionName.find("Complaint") != std::string::npos;
+	}
+
+	const char* NetDirectionOf(UEFunction Function)
+	{
+		if (!Function.HasFlags(EFunctionFlags::Net))
+			return "None";
+		if (Function.HasFlags(EFunctionFlags::NetServer))
+			return "Server";
+		if (Function.HasFlags(EFunctionFlags::NetClient))
+			return "Client";
+		if (Function.HasFlags(EFunctionFlags::NetMulticast))
+			return "Multicast";
+		return "Net";
+	}
+
+	uintptr_t MaskRuntimePointer(uintptr_t Address)
+	{
+		return Address & 0x0000FFFFFFFFFFFFULL;
+	}
+
+	std::string SanitizeFunctionIdentifier(const std::string& Value)
+	{
+		std::string Out;
+		Out.reserve(Value.size() + 1);
+
+		for (char C : Value)
+		{
+			const unsigned char U = static_cast<unsigned char>(C);
+			if (std::isalnum(U) || C == '_')
+				Out.push_back(C);
+			else
+				Out.push_back('_');
+		}
+
+		if (Out.empty() || std::isdigit(static_cast<unsigned char>(Out.front())))
+			Out.insert(Out.begin(), '_');
+
+		return Out;
+	}
+
+	std::string NetEnumToken(const char* Net)
+	{
+		const std::string Value = Net ? Net : "None";
+		if (Value == "Server") return "Server";
+		if (Value == "Client") return "Client";
+		if (Value == "Multicast") return "Multicast";
+		if (Value == "None") return "None";
+		return "Other";
+	}
+
+	void WriteReportEntryDetailed(std::ostream& Out, const FReportFunctionEntry& Entry)
+	{
+		Out << (Entry.bKey ? "[KEY] " : "      ")
+			<< Entry.ClassName << "::" << Entry.FunctionName << "\n";
+		Out << "      full=" << Entry.FullName << "\n";
+		Out << "      net=" << Entry.Net
+			<< " native=" << (Entry.bNative ? "yes" : "no") << "\n";
+		Out << "      exec=0x" << std::uppercase << std::hex << std::setw(16) << std::setfill('0') << Entry.ExecAddress
+			<< " rva=0x" << std::setw(8) << Entry.Rva
+			<< " unslid=0x" << std::setw(16) << Entry.Unslid
+			<< std::dec << std::nouppercase << std::setfill(' ') << "\n";
+		Out << "      vtable=";
+		if (Entry.VTableOffset != UINT32_MAX)
+		{
+			Out << "0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << Entry.VTableOffset
+				<< std::dec << std::nouppercase << std::setfill(' ')
+				<< " (idx " << (Entry.VTableOffset / 8) << ") via " << (Entry.VTableVia ? Entry.VTableVia : "?");
+		}
+		else
+		{
+			Out << "-";
+		}
+		Out << "\n      flags=" << Entry.Flags << "\n";
+		if (!Entry.Params.empty())
+			Out << "      params=" << Entry.Params << "\n";
+	}
+
+	void WriteReportEntryCompact(std::ostream& Out, const FReportFunctionEntry& Entry)
+	{
+		Out << (Entry.bKey ? "[KEY] " : "      ")
+			<< Entry.ClassName << "::" << Entry.FunctionName
+			<< " | net=" << Entry.Net
+			<< " | native=" << (Entry.bNative ? "yes" : "no")
+			<< " | rva=0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << Entry.Rva
+			<< " | vtable=";
+		if (Entry.VTableOffset != UINT32_MAX)
+		{
+			Out << "0x" << std::setw(4) << Entry.VTableOffset
+				<< "/idx=" << std::dec << (Entry.VTableOffset / 8);
+		}
+		else
+		{
+			Out << "-";
+		}
+		Out << std::dec << std::nouppercase << std::setfill(' ') << "\n";
+	}
+}
+
+void DumpPUBGReportFunctions(const fs::path& GameFolder)
+{
+	if (!Settings::Internal::bIsPUBGProfile)
+		return;
+
+	const fs::path TxtPath = GameFolder / "PUBGReportFunctions.txt";
+	const fs::path HppPath = GameFolder / "PUBGReportFunctions.hpp";
+
+	const MachImageInfo Image = GetImageBaseAndSize();
+	std::vector<FReportFunctionEntry> Entries;
+	std::unordered_set<std::string> Seen;
+
+	for (UEObject Object : ObjectArray())
+	{
+		const void* Address = Object.GetAddress();
+		if (!Address || IsBadReadPtr(Address))
+			continue;
+		if (!Object.IsA(EClassCastFlags::Function))
+			continue;
+
+		const std::string FunctionName = Object.GetName();
+		UEObject Outer = Object.GetOuter();
+		const std::string ClassName = Outer ? Outer.GetName() : "None";
+
+		const std::string LowerFunction = str_tolower(FunctionName);
+		const std::string LowerClass = str_tolower(ClassName);
+		if (!IsReportRelatedText(LowerFunction) && !IsReportRelatedText(LowerClass))
+			continue;
+
+		const std::string Key = ClassName + "::" + FunctionName;
+		if (!Seen.insert(Key).second)
+			continue;
+
+		UEFunction Function = Object.Cast<UEFunction>();
+
+		FReportFunctionEntry Entry;
+		Entry.ClassName = ClassName;
+		Entry.FunctionName = FunctionName;
+		Entry.FullName = Function.GetFullName();
+		Entry.Flags = Function.StringifyFlags(", ");
+		Entry.Params = Function.GetParamStructName();
+		Entry.Net = NetDirectionOf(Function);
+		Entry.bNative = Function.HasFlags(EFunctionFlags::Native);
+		Entry.bKey = IsKeyReportFunction(FunctionName);
+
+		void* Exec = Function.GetExecFunction();
+		Entry.ExecAddress = MaskRuntimePointer(reinterpret_cast<uintptr_t>(Exec));
+		if (Entry.ExecAddress && Image.Base)
+		{
+			if (Entry.ExecAddress >= Image.Base)
+				Entry.Rva = Entry.ExecAddress - Image.Base;
+			Entry.Unslid = Entry.ExecAddress - static_cast<uintptr_t>(Image.Slide);
+		}
+
+		/* Vtable slots are only meaningful for reflected native functions.  For
+		 * script functions ExecFunction usually points at the shared script VM
+		 * thunk and must not be interpreted as a per-function native pointer. */
+		if (Entry.bNative && Outer && Outer.IsA(EClassCastFlags::Class))
+		{
+			UEClass OwnerClass = Outer.Cast<UEClass>();
+			const PUBGResolveResult VTable = ResolveVTableMember(OwnerClass, FunctionName);
+			if (VTable.bFound)
+			{
+				Entry.VTableOffset = VTable.Offset;
+				Entry.VTableVia = VTable.Via;
+			}
+		}
+
+		Entries.push_back(std::move(Entry));
+	}
+
+	std::sort(Entries.begin(), Entries.end(), [](const FReportFunctionEntry& A, const FReportFunctionEntry& B)
+	{
+		if (A.ClassName != B.ClassName)
+			return A.ClassName < B.ClassName;
+		return A.FunctionName < B.FunctionName;
+	});
+
+	size_t NativeCount = 0;
+	size_t KeyCount = 0;
+	size_t VTableCount = 0;
+	size_t NetServerCount = 0;
+	size_t NetClientCount = 0;
+	size_t NetMulticastCount = 0;
+
+	for (const FReportFunctionEntry& Entry : Entries)
+	{
+		if (Entry.bNative) ++NativeCount;
+		if (Entry.bKey) ++KeyCount;
+		if (Entry.VTableOffset != UINT32_MAX) ++VTableCount;
+		if (std::strcmp(Entry.Net, "Server") == 0) ++NetServerCount;
+		else if (std::strcmp(Entry.Net, "Client") == 0) ++NetClientCount;
+		else if (std::strcmp(Entry.Net, "Multicast") == 0) ++NetMulticastCount;
+	}
+
+	std::ofstream Out(TxtPath);
+	if (!Out)
+	{
+		LogError("DumpPUBGReportFunctions: failed to open %s", TxtPath.string().c_str());
+		return;
+	}
+
+	Out << "PUBG Mobile Report / Complaint functions\n";
+	Out << "Generated from the live UObject reflection array.\n";
+	Out << "Bundle: " << Settings::Generator::BundleIdentifier
+		<< " | version: " << Settings::Generator::BundleVersion << "\n";
+	Out << "Image base: 0x" << std::uppercase << std::hex << Image.Base
+		<< " | slide: 0x" << static_cast<uintptr_t>(Image.Slide)
+		<< std::dec << std::nouppercase << "\n";
+	Out << "Functions: " << Entries.size()
+		<< " | native: " << NativeCount
+		<< " | net server/client/multicast: " << NetServerCount << "/" << NetClientCount << "/" << NetMulticastCount
+		<< " | key: " << KeyCount
+		<< " | vtable resolved: " << VTableCount << "\n\n";
+
+	Out << "== QUICK ANSWERS ==\n";
+	Out << "1. Exact UFunction names are in the FULL LIST below.\n";
+	Out << "2. Server report RPC offsets are in KEY FUNCTIONS (look for ASTExtraPlayerController).\n";
+	Out << "3. vtable values are only available for reflected native UFUNCTIONs. Raw C++\n";
+	Out << "   virtuals such as UNetDriver::ServerReplicateActors and UActorChannel::SendBunch\n";
+	Out << "   are not UFUNCTIONs and must be resolved from the NetDriver vtable in IDA.\n\n";
+
+	Out << "== KEY REPORT/COMPLAINT FUNCTIONS ==\n";
+	if (KeyCount == 0)
+	{
+		Out << "(none found in this build)\n";
+	}
+	else
+	{
+		for (const FReportFunctionEntry& Entry : Entries)
+		{
+			if (Entry.bKey)
+				WriteReportEntryDetailed(Out, Entry);
+		}
+	}
+
+	Out << "\n== FULL LIST ==\n";
+	for (const FReportFunctionEntry& Entry : Entries)
+		WriteReportEntryCompact(Out, Entry);
+
+	Out << "\n== NOTES ==\n";
+	Out << "- rva = runtime address - main image base (image-relative, no slide).\n";
+	Out << "- unslid = runtime address - Mach-O slide (the static address used in IDA).\n";
+	Out << "- vtable is a byte offset from the object vptr; idx = vtable / 8.\n";
+	Out << "- exec is UFunction::ExecFunction. For native functions it is the exec thunk\n";
+	Out << "  registered by UHT, not necessarily the C++ method body.\n";
+	Out << "- script functions share a common VM thunk; their exec value is not unique.\n";
+
+	Out.close();
+
+	std::ofstream Hpp(HppPath);
+	if (!Hpp)
+	{
+		LogError("DumpPUBGReportFunctions: failed to open %s", HppPath.string().c_str());
+		return;
+	}
+
+	Hpp << "#ifndef PUBGReportFunctions_hpp\n";
+	Hpp << "#define PUBGReportFunctions_hpp\n\n";
+	Hpp << "// Auto-generated by Dumper-7 (iOS port) for PUBG Mobile.\n";
+	Hpp << "// RVA values are image-relative offsets of UFunction::ExecFunction.\n";
+	Hpp << "// VTable values are byte offsets from the object vptr; 0xFFFFFFFF means\n";
+	Hpp << "// unresolved (non-virtual or not reflected). VTableIndex = VTable / 8.\n";
+	Hpp << "// Net values are None, Server, Client, Multicast, or Other.\n\n";
+
+	std::unordered_set<std::string> UsedMacros;
+	for (const FReportFunctionEntry& Entry : Entries)
+	{
+		const std::string Base = "kFn_" + SanitizeFunctionIdentifier(Entry.ClassName)
+			+ "_" + SanitizeFunctionIdentifier(Entry.FunctionName);
+
+		std::string Name = Base;
+		for (unsigned Suffix = 2; UsedMacros.count(Name) != 0; ++Suffix)
+		{
+			Name = Base + "_" + std::to_string(Suffix);
+		}
+		UsedMacros.insert(Name);
+
+		const uint32_t VTable = Entry.VTableOffset;
+		const uint32_t VTableIndex = VTable == UINT32_MAX ? UINT32_MAX : VTable / 8;
+
+		Hpp << "#define " << Name << " \"0x"
+			<< std::uppercase << std::hex << std::setw(8) << std::setfill('0') << Entry.Rva
+			<< std::dec << std::nouppercase << std::setfill(' ') << "\"\n";
+		Hpp << "#define " << Name << "_VTable \"0x"
+			<< std::uppercase << std::hex << std::setw(8) << std::setfill('0') << VTable
+			<< std::dec << std::nouppercase << std::setfill(' ') << "\"\n";
+		Hpp << "#define " << Name << "_VTableIndex \"0x"
+			<< std::uppercase << std::hex << std::setw(8) << std::setfill('0') << VTableIndex
+			<< std::dec << std::nouppercase << std::setfill(' ') << "\"\n";
+		Hpp << "#define " << Name << "_Net \"" << Entry.Net << "\"\n";
+	}
+
+	Hpp << "\nnamespace PUBGReportFunctions\n{\n";
+	Hpp << "    enum class ENet : unsigned char { None, Server, Client, Multicast, Other };\n\n";
+	Hpp << "    struct FEntry\n";
+	Hpp << "    {\n";
+	Hpp << "        const char* Class;\n";
+	Hpp << "        const char* Name;\n";
+	Hpp << "        ENet Net;\n";
+	Hpp << "        unsigned int Rva;\n";
+	Hpp << "        unsigned int VTableOffset;\n";
+	Hpp << "        unsigned int VTableIndex;\n";
+	Hpp << "        bool bNative;\n";
+	Hpp << "    };\n\n";
+	Hpp << "    inline constexpr FEntry Entries[] =\n";
+	Hpp << "    {\n";
+
+	for (const FReportFunctionEntry& Entry : Entries)
+	{
+		const uint32_t VTable = Entry.VTableOffset;
+		const uint32_t VTableIndex = VTable == UINT32_MAX ? UINT32_MAX : VTable / 8;
+
+		Hpp << "        { \"" << Entry.ClassName << "\", \"" << Entry.FunctionName << "\", ENet::"
+			<< NetEnumToken(Entry.Net) << ", 0x"
+			<< std::uppercase << std::hex << std::setw(8) << std::setfill('0') << Entry.Rva
+			<< ", 0x" << std::setw(8) << VTable
+			<< ", 0x" << std::setw(8) << VTableIndex
+			<< std::dec << std::nouppercase << std::setfill(' ')
+			<< ", " << (Entry.bNative ? "true" : "false") << " },\n";
+	}
+
+	Hpp << "    };\n";
+	Hpp << "}\n\n";
+	Hpp << "#endif // PUBGReportFunctions_hpp\n";
+	Hpp.close();
+
+	LogSuccess("DumpPUBGReportFunctions: wrote %s and %s (%zu functions, %zu native, %zu key, %zu vtable)",
+		TxtPath.string().c_str(), HppPath.string().c_str(),
+		Entries.size(), NativeCount, KeyCount, VTableCount);
 }
 
 namespace
