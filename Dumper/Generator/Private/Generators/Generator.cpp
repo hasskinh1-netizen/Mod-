@@ -1,4 +1,5 @@
 
+#include <algorithm>
 #include <fstream>
 #include <cstdint>
 #include <ctime>
@@ -606,7 +607,16 @@ namespace
 	{
 		Reflected,  /* exact reflected member resolved from the live dump */
 		Candidate,  /* likely member; emitted for verification on the target build */
-		Manual,     /* vtable/function or stable struct offset; not reflected */
+		VTable,     /* native UFunction slot resolved from the live class vtable */
+		Manual,     /* stable struct offset that reflection cannot discover */
+	};
+
+	enum class EPUBGResolve : uint8_t
+	{
+		Member,      /* exact member in the listed class hierarchy */
+		DeepMember,  /* member discovered on any class matching Hints */
+		VTable,      /* native UFunction -> vtable byte offset */
+		Manual,      /* keep Fallback */
 	};
 
 	struct PUBGOffsetSpec
@@ -617,17 +627,21 @@ namespace
 		uint32_t Fallback;
 		EPUBGOffsetKind Kind = EPUBGOffsetKind::Reflected;
 		const char* Note = nullptr;
+		EPUBGResolve Resolve = EPUBGResolve::Member;
+		const char* Hints = nullptr;                  /* '|' separated owner-class substrings */
+		EClassCastFlags ExpectedType = EClassCastFlags::None;
 	};
 
 	/* The macro names/values are the ones used by the common PUBG iOS bases.
-	 * Reflected entries are resolved from the live dump.  Candidate entries use
-	 * a likely member name and are marked for verification.  Manual entries are
-	 * vtable/function offsets or stable struct offsets that reflection cannot
-	 * discover; they keep the known 4.x value and are documented in the output. */
+	 * Every entry is resolved from the live dump with the deepest strategy that
+	 * can identify it: exact member, hinted deep member search (including a
+	 * type filter), or native-function vtable scan.  Manual entries are stable
+	 * struct offsets that reflection cannot discover.  Fallback is only used
+	 * when the live build cannot identify the entry, and is always labelled. */
 	const PUBGOffsetSpec GPUBGOffsetSpecs[] =
 	{
-		{ "kLineOfSightTo",              "",                            "",                        0x7A8, EPUBGOffsetKind::Manual,
-		  "AController::LineOfSightTo vtable byte offset (not a reflected field)" },
+		{ "kLineOfSightTo",              "Controller",                  "LineOfSightTo",           0x7A8, EPUBGOffsetKind::VTable,
+		  "vtable slot of AController::LineOfSightTo", EPUBGResolve::VTable },
 		{ "kPersistentLevel",            "World",                       "PersistentLevel",         0x30   },
 		{ "kNetDriver",                  "World",                       "NetDriver",               0x38   },
 		{ "kServerConnection",           "NetDriver",                   "ServerConnection",        0x78   },
@@ -684,38 +698,45 @@ namespace
 		{ "kFuelMax",                    "VehicleCommonComponent",      "FuelMax",                 0x0438 },
 		{ "kPickUpDataList",             "PickUpListWrapperActor,PickUpDataComponent", "PickUpDataList", 0x08D0 },
 		{ "kGoodsID",                    "",                            "",                        0x38, EPUBGOffsetKind::Manual,
-		  "box goods ID offset (stable 4.x struct offset, not reflected)" },
-		{ "kTableName",                  "PickUpListWrapperActor,PickUpWrapperActor,PickUpDataComponent,PlayerTombBox",
-		                                                                "ItemTableName",           0x920, EPUBGOffsetKind::Candidate,
-		  "box item table FString; verify on target" },
+		  "legacy box goods-ID offset; FPickUpItemData 0x38 is now OverrideDropGroundLifeSpan in 4.7 (not reflected)", EPUBGResolve::Manual },
+		{ "kTableName",                  "BackpackBlueprintUtils",      "ItemTableName",           0x340, EPUBGOffsetKind::Reflected,
+		  "backpack item table FString (4.6 was 0x910)" },
 		{ "kCurrentStates",              "STExtraCharacter",            "CurrentStates",           0x1058 },
 		{ "kFPS",                        "",                            "",                        0x1C4, EPUBGOffsetKind::Manual,
-		  "legacy FPS offset kept for base compatibility (not reflected; usually unused)" },
-		{ "kBP_MapUIMarkManager_C",      "BP_STExtraPlayerController_C,STExtraPlayerController_C",
-		                                                                "BP_MapUIMarkManager",     0x4270, EPUBGOffsetKind::Candidate,
-		  "blueprint component pointer on the player controller; verify on target" },
+		  "legacy FPS offset kept for base compatibility (not reflected; usually unused)", EPUBGResolve::Manual },
+		{ "kBP_MapUIMarkManager_C",      "BP_STExtraPlayerController_C,STExtraPlayerController_C,STExtraPlayerController,PlayerController",
+		                                                                "MapUIMarkManager",        0x4270, EPUBGOffsetKind::Candidate,
+		  "blueprint component pointer on the player controller", EPUBGResolve::DeepMember,
+		  "BP_STExtraPlayerController|STExtraPlayerController|PlayerController",
+		  EClassCastFlags::ObjectProperty },
 		{ "kpExtraGameState",            "MapUIMarkManager",            "pExtraGameState",         0x0428 },
 		{ "kAlivePlayerNum",             "STExtraGameStateBase",        "AlivePlayerNum",          0x0BB4 },
 		{ "kPlayerNum",                  "STExtraGameStateBase",        "PlayerNum",               0x0818 },
 		{ "kelapsedSeconds",             "GameState",                   "ElapsedTime",             0x04DC },
 		{ "kPlayerState",                "Controller",                  "PlayerState",             0x04D0 },
 		{ "kKill",                       "UAEPlayerState",              "Kills",                   0x06C8 },
-		{ "kTPP",                        "STExtraBaseCharacter",        "ThirdPersonCameraComponent", 0x1C50, EPUBGOffsetKind::Candidate,
-		  "inferred from the kTPP name; verify on target" },
-		{ "kFPP",                        "STExtraBaseCharacter",        "FPPCameraComp",           0x1C60, EPUBGOffsetKind::Candidate,
-		  "inferred from the kFPP name; verify on target" },
+		{ "kTPP",                        "STExtraBaseCharacter,STExtraPlayerCharacter", "ThirdPersonCamera",       0x1C50, EPUBGOffsetKind::Candidate,
+		  "third-person camera component on the base character", EPUBGResolve::DeepMember,
+		  "STExtraBaseCharacter|STExtraPlayerCharacter|BaseCharacter|Character",
+		  EClassCastFlags::ObjectProperty },
+		{ "kFPP",                        "STExtraBaseCharacter,STExtraPlayerCharacter", "FPPCamera",               0x1C60, EPUBGOffsetKind::Candidate,
+		  "first-person camera component on the base character", EPUBGResolve::DeepMember,
+		  "STExtraBaseCharacter|STExtraPlayerCharacter|BaseCharacter|Character",
+		  EClassCastFlags::ObjectProperty },
 		{ "kGameReplayType",             "UAEPlayerController",         "GameReplayType",          0x0944 },
-		{ "kPickUpAnim",                 "STExtraBaseCharacter",        "MainCharAnimClass",       0x1E28 },
+		{ "kPickUpAnim",                 "STExtraBaseCharacter",        "MainCharAnimClass",       0x1E28, EPUBGOffsetKind::Reflected,
+		  nullptr, EPUBGResolve::DeepMember,
+		  "STExtraBaseCharacter|STExtraPlayerCharacter|BaseCharacter|Character" },
 		{ "kPressingFireBtn",            "STExtraPlayerController",     "bIsPressingFireBtn",      0x33D0 },
 		{ "kCurrentReloadWeapon",        "STExtraBaseCharacter",        "CurrentReloadWeapon",     0x2B58 },
 		{ "kCachedBulletTrackComponent", "STExtraShootWeapon",          "CachedBulletTrackComponent", 0x0E28 },
 		{ "wuhou",                       "SceneComponent",              "RelativeRotation",        0x190  },
-		{ "kYaw",                        "",                            "",                        0x888, EPUBGOffsetKind::Manual,
-		  "APlayerController::AddYawInput vtable byte offset (not a reflected field)" },
-		{ "kRoll",                       "",                            "",                        0x890, EPUBGOffsetKind::Manual,
-		  "APlayerController::AddRollInput vtable byte offset (not a reflected field)" },
-		{ "kPitch",                      "",                            "",                        0x880, EPUBGOffsetKind::Manual,
-		  "APlayerController::AddPitchInput vtable byte offset (not a reflected field)" },
+		{ "kYaw",                        "PlayerController",            "AddYawInput",             0x888, EPUBGOffsetKind::VTable,
+		  "vtable slot of APlayerController::AddYawInput", EPUBGResolve::VTable },
+		{ "kRoll",                       "PlayerController",            "AddRollInput",            0x890, EPUBGOffsetKind::VTable,
+		  "vtable slot of APlayerController::AddRollInput", EPUBGResolve::VTable },
+		{ "kPitch",                      "PlayerController",            "AddPitchInput",           0x880, EPUBGOffsetKind::VTable,
+		  "vtable slot of APlayerController::AddPitchInput", EPUBGResolve::VTable },
 	};
 
 	std::vector<std::string> SplitClassList(const char* List)
@@ -757,6 +778,401 @@ namespace
 			Current = Super;
 		}
 		return false;
+	}
+
+	std::vector<std::string> SplitHintList(const char* List)
+	{
+		std::vector<std::string> Out;
+		if (!List || !*List)
+			return Out;
+
+		std::string_view View(List);
+		size_t Start = 0;
+		while (Start <= View.size())
+		{
+			const size_t Pipe = View.find('|', Start);
+			const size_t End = Pipe == std::string_view::npos ? View.size() : Pipe;
+			std::string Hint(View.substr(Start, End - Start));
+			if (!Hint.empty())
+				Out.push_back(str_tolower(std::move(Hint)));
+			if (Pipe == std::string_view::npos)
+				break;
+			Start = Pipe + 1;
+		}
+		return Out;
+	}
+
+	int32 MatchHintRank(const std::string& LowerClassName, const std::vector<std::string>& Hints)
+	{
+		for (size_t i = 0; i < Hints.size(); ++i)
+		{
+			if (LowerClassName.find(Hints[i]) != std::string::npos)
+				return static_cast<int32>(i);
+		}
+		return -1;
+	}
+
+	bool IsExecutablePointer(uintptr_t Address)
+	{
+		if (!Address)
+			return false;
+
+		const uintptr_t Pointer = Address & 0x0000FFFFFFFFFFFFULL;
+		if ((Pointer & 0x3) != 0)
+			return false;
+
+		const MachImageInfo Image = GetImageBaseAndSize();
+		if (!Image.Header)
+			return false;
+
+		uintptr_t CommandPtr = reinterpret_cast<uintptr_t>(Image.Header + 1);
+		for (uint32_t i = 0; i < Image.Header->ncmds; ++i)
+		{
+			const auto* Command = reinterpret_cast<const struct load_command*>(CommandPtr);
+			if (Command->cmd == LC_SEGMENT_64)
+			{
+				const auto* Segment = reinterpret_cast<const struct segment_command_64*>(Command);
+				if ((Segment->initprot & VM_PROT_EXECUTE) != 0)
+				{
+					const uintptr_t Start = Segment->vmaddr + Image.Slide;
+					if (Pointer >= Start && Pointer < Start + Segment->vmsize)
+						return true;
+				}
+			}
+			CommandPtr += Command->cmdsize;
+		}
+		return false;
+	}
+
+	UEFunction FindFunctionInHierarchy(UEClass Class, const std::string& FunctionName)
+	{
+		for (UEStruct Current = Class; Current && Current.GetAddress(); )
+		{
+			for (UEField Field = Current.GetChild(); Field; Field = Field.GetNext())
+			{
+				if (Field.IsA(EClassCastFlags::Function) && Field.GetName() == FunctionName)
+					return Field.Cast<UEFunction>();
+			}
+
+			UEStruct Super = Current.GetSuper();
+			if (Super.GetAddress() == Current.GetAddress())
+				break;
+			Current = Super;
+		}
+		return nullptr;
+	}
+
+	uint32_t ScanVTableForPointer(UEClass Class, uintptr_t Function)
+	{
+		if (!Class || !Function)
+			return UINT32_MAX;
+
+		UEObject DefaultObject = Class.GetDefaultObject();
+		if (!DefaultObject || !DefaultObject.GetAddress())
+			return UINT32_MAX;
+
+		void* VTable = DefaultObject.GetVft();
+		if (!VTable || IsBadReadPtr(VTable))
+			return UINT32_MAX;
+
+		auto* Slots = reinterpret_cast<uintptr_t*>(VTable);
+		const uintptr_t Target = Function & 0x0000FFFFFFFFFFFFULL;
+		constexpr int32 MaxSlots = 4096;
+
+		for (int32 Index = 0; Index < MaxSlots; ++Index)
+		{
+			if (IsBadReadPtr(&Slots[Index]))
+				break;
+
+			if ((Slots[Index] & 0x0000FFFFFFFFFFFFULL) == Target)
+				return static_cast<uint32_t>(Index * static_cast<int32>(sizeof(void*)));
+		}
+		return UINT32_MAX;
+	}
+
+	/* Native UFUNCTIONs are registered through an exec thunk, so the pointer in
+	 * UFunction::ExecFunction is usually not the vtable slot itself.  The thunk
+	 * still performs the virtual dispatch, so decode its `load vptr -> load slot
+	 * -> blr` chain and return the byte offset of the loaded slot. */
+	uint32_t DecodeVTableSlotFromThunk(uintptr_t Function)
+	{
+		if (!IsExecutablePointer(Function))
+			return UINT32_MAX;
+
+		const uint32_t* Code = reinterpret_cast<const uint32_t*>(Function);
+
+		enum ERegisterState : uint8_t { StateNone, StateObject, StateVTable, StateFunction };
+		uint8_t State[31] = {};
+		uint32_t Slot[31] = {};
+		for (uint32_t& Value : Slot)
+			Value = UINT32_MAX;
+		State[0] = StateObject; /* x0 = Context (the UObject `this`) */
+
+		auto LoadRegister = [&](int32 Destination, int32 Source, uint32_t Offset)
+		{
+			if (Destination >= 31 || Source >= 31)
+				return;
+
+			if (State[Source] == StateObject && Offset == 0)
+			{
+				/* vptr = *(void**)this */
+				State[Destination] = StateVTable;
+				Slot[Destination] = 0;
+			}
+			else if (State[Source] == StateVTable)
+			{
+				State[Destination] = StateFunction;
+				Slot[Destination] = (Slot[Source] == UINT32_MAX ? 0 : Slot[Source]) + Offset;
+			}
+			else if (State[Source] == StateObject)
+			{
+				State[Destination] = StateObject;
+				Slot[Destination] = UINT32_MAX;
+			}
+			else
+			{
+				State[Destination] = StateNone;
+				Slot[Destination] = UINT32_MAX;
+			}
+		};
+
+		constexpr int32 MaxInstructions = 192;
+		for (int32 Index = 0; Index < MaxInstructions; ++Index)
+		{
+			if (IsBadReadPtr(&Code[Index]))
+				break;
+
+			const uint32_t Instruction = Code[Index];
+
+			/* LDR Xt, [Xn, #imm12 * 8] */
+			if ((Instruction & 0xFFC00000) == 0xF9400000)
+			{
+				const int32 Rt = Instruction & 0x1F;
+				const int32 Rn = (Instruction >> 5) & 0x1F;
+				const uint32_t Offset = ((Instruction >> 10) & 0xFFF) * 8;
+				LoadRegister(Rt, Rn, Offset);
+				continue;
+			}
+
+			/* LDUR Xt, [Xn, #simm9] */
+			if ((Instruction & 0xFFE00C00) == 0xF8400000)
+			{
+				const int32 Rt = Instruction & 0x1F;
+				const int32 Rn = (Instruction >> 5) & 0x1F;
+				int32 Offset = static_cast<int32>((Instruction >> 12) & 0x1FF);
+				if (Offset & 0x100)
+					Offset |= ~0x1FF;
+				if (Offset >= 0)
+					LoadRegister(Rt, Rn, static_cast<uint32_t>(Offset));
+				continue;
+			}
+
+			/* MOV Xd, Xm (ORR Xd, XZR, Xm) */
+			if ((Instruction & 0xFFE0FFE0) == 0xAA0003E0)
+			{
+				const int32 Rd = Instruction & 0x1F;
+				const int32 Rm = (Instruction >> 16) & 0x1F;
+				State[Rd] = State[Rm];
+				Slot[Rd] = Slot[Rm];
+				continue;
+			}
+
+			/* ADD Xd, Xn, #imm12 (LSL #0) */
+			if ((Instruction & 0xFFC00000) == 0x91000000)
+			{
+				const int32 Rd = Instruction & 0x1F;
+				const int32 Rn = (Instruction >> 5) & 0x1F;
+				const uint32_t Offset = (Instruction >> 10) & 0xFFF;
+				if (State[Rn] == StateVTable)
+				{
+					State[Rd] = StateVTable;
+					Slot[Rd] = (Slot[Rn] == UINT32_MAX ? 0 : Slot[Rn]) + Offset;
+				}
+				else
+				{
+					State[Rd] = State[Rn];
+					Slot[Rd] = UINT32_MAX;
+				}
+				continue;
+			}
+
+			/* BLR Xn / BR Xn */
+			if ((Instruction & 0xFFFFFC1F) == 0xD63F0000 ||
+				(Instruction & 0xFFFFFC1F) == 0xD61F0000)
+			{
+				const int32 Rn = (Instruction >> 5) & 0x1F;
+				if (State[Rn] == StateFunction && Slot[Rn] >= 0x100 && Slot[Rn] < 0x10000)
+					return Slot[Rn];
+			}
+		}
+
+		return UINT32_MAX;
+	}
+
+	bool IsVTableSlotExecutable(UEClass Class, uint32_t SlotOffset)
+	{
+		if ((SlotOffset & 0x7) != 0 || SlotOffset < 0x100 || SlotOffset >= 0x8000)
+			return false;
+
+		UEObject DefaultObject = Class.GetDefaultObject();
+		if (!DefaultObject || !DefaultObject.GetAddress())
+			return false;
+
+		void* VTable = DefaultObject.GetVft();
+		if (!VTable || IsBadReadPtr(VTable))
+			return false;
+
+		const uintptr_t* Slots = reinterpret_cast<const uintptr_t*>(VTable);
+		const int32 Index = static_cast<int32>(SlotOffset / sizeof(void*));
+		if (IsBadReadPtr(&Slots[Index]))
+			return false;
+
+		return IsExecutablePointer(Slots[Index]);
+	}
+
+	struct PUBGMemberMatch
+	{
+		bool bFound = false;
+		uint32_t Offset = 0;
+		std::string Owner;
+		std::string Member;
+	};
+
+	struct PUBGResolveResult
+	{
+		bool bFound = false;
+		uint32_t Offset = 0;
+		std::string Owner;
+		std::string Member;
+		const char* Via = nullptr;
+	};
+
+	PUBGMemberMatch FindDeepMember(const PUBGOffsetSpec& Spec,
+		const std::vector<std::pair<std::string, UEClass>>& AllClasses)
+	{
+		PUBGMemberMatch Best;
+		int32 BestScore = -1;
+
+		const std::vector<std::string> Hints = SplitHintList(Spec.Hints);
+		const std::vector<std::string> Preferred = SplitClassList(Spec.Classes);
+		const std::string Wanted = Spec.Member ? Spec.Member : "";
+		const std::string WantedLower = str_tolower(Wanted);
+
+		for (const auto& [ClassName, Class] : AllClasses)
+		{
+			const std::string LowerClassName = str_tolower(ClassName);
+			const int32 Rank = Hints.empty() ? 0 : MatchHintRank(LowerClassName, Hints);
+			if (Rank < 0)
+				continue;
+
+			int32 PreferredRank = -1;
+			for (size_t i = 0; i < Preferred.size(); ++i)
+			{
+				if (ClassName == Preferred[i])
+				{
+					PreferredRank = static_cast<int32>(i);
+					break;
+				}
+			}
+
+			for (UEStruct Current = Class; Current && Current.GetAddress(); )
+			{
+				for (UEField Field = Current.GetChild(); Field; Field = Field.GetNext())
+				{
+					if (!Field.IsA(EClassCastFlags::Property))
+						continue;
+
+					UEProperty Property = Field.Cast<UEProperty>();
+					if (Spec.ExpectedType != EClassCastFlags::None && !Property.IsA(Spec.ExpectedType))
+						continue;
+
+					const std::string PropertyName = Property.GetName();
+					int32 Match = 0;
+					if (PropertyName == Wanted)
+					{
+						Match = 3;
+					}
+					else if (!WantedLower.empty())
+					{
+						const std::string LowerName = str_tolower(PropertyName);
+						if (LowerName == WantedLower)
+							Match = 2;
+						else if (LowerName.find(WantedLower) != std::string::npos)
+							Match = 1;
+					}
+
+					if (Match == 0)
+						continue;
+
+					const int32 Offset = Property.GetOffset();
+					if (Offset <= 0 || Offset >= 0x100000)
+						continue;
+
+					/* The listed class is a much stronger signal than a
+					 * substring hit somewhere else in the hierarchy; the
+					 * preferred-class bonus therefore outweighs one match
+					 * level.  Rank only breaks ties between hinted classes. */
+					const int32 MatchScore = Match == 3 ? 3000 : (Match == 2 ? 2000 : 1000);
+					const int32 PreferredScore = PreferredRank >= 0 ? 4000 - PreferredRank : 0;
+					const int32 Score = PreferredScore + MatchScore - Rank;
+
+					const bool bBetter = (Score > BestScore)
+						|| (Score == BestScore && Best.bFound && PropertyName.size() < Best.Member.size());
+
+					if (bBetter)
+					{
+						BestScore = Score;
+						Best.bFound = true;
+						Best.Offset = static_cast<uint32_t>(Offset);
+						Best.Owner = Current.GetName();
+						Best.Member = PropertyName;
+					}
+				}
+
+				UEStruct Super = Current.GetSuper();
+				if (Super.GetAddress() == Current.GetAddress())
+					break;
+				Current = Super;
+			}
+		}
+
+		return Best;
+	}
+
+	PUBGResolveResult ResolveVTableMember(UEClass Class, const std::string& FunctionName)
+	{
+		PUBGResolveResult Result;
+
+		UEFunction Function = FindFunctionInHierarchy(Class, FunctionName);
+		if (!Function)
+			return Result;
+
+		const uintptr_t Target = reinterpret_cast<uintptr_t>(Function.GetExecFunction()) & 0x0000FFFFFFFFFFFFULL;
+		if (!IsExecutablePointer(Target))
+			return Result;
+
+		uint32_t SlotOffset = ScanVTableForPointer(Class, Target);
+		if (SlotOffset != UINT32_MAX)
+		{
+			Result.bFound = true;
+			Result.Offset = SlotOffset;
+			Result.Owner = Function.GetOuter().GetName();
+			Result.Member = FunctionName;
+			Result.Via = "direct";
+			return Result;
+		}
+
+		SlotOffset = DecodeVTableSlotFromThunk(Target);
+		if (SlotOffset != UINT32_MAX && IsVTableSlotExecutable(Class, SlotOffset))
+		{
+			Result.bFound = true;
+			Result.Offset = SlotOffset;
+			Result.Owner = Function.GetOuter().GetName();
+			Result.Member = FunctionName;
+			Result.Via = "exec thunk";
+		}
+
+		return Result;
 	}
 
 	std::string TimestampNow()
@@ -811,6 +1227,7 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 	}
 
 	std::unordered_map<std::string, UEClass> Classes;
+	std::vector<std::pair<std::string, UEClass>> AllClasses;
 	for (UEObject Object : ObjectArray())
 	{
 		const void* Address = Object.GetAddress();
@@ -820,36 +1237,73 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 			continue;
 
 		const std::string Name = Object.GetName();
+		const UEClass Class = Object.Cast<UEClass>();
+		AllClasses.emplace_back(Name, Class);
+
 		if (WantedClasses.count(Name) && Classes.find(Name) == Classes.end())
-			Classes.emplace(Name, Object.Cast<UEClass>());
+			Classes.emplace(Name, Class);
 	}
 
-	LogInfo("DumpPUBGOffsetsHeader: resolved %zu/%zu reflection classes", Classes.size(), WantedClasses.size());
+	LogInfo("DumpPUBGOffsetsHeader: indexed %zu reflection classes (%zu requested)",
+		AllClasses.size(), WantedClasses.size());
 
 	Out << "#ifndef PUBGOffsets_hpp\n";
 	Out << "#define PUBGOffsets_hpp\n\n";
 	Out << "// Auto-generated by Dumper-7 (iOS port) for PUBG Mobile.\n";
-	Out << "// Reflected values were resolved from the live SDK dump.\n";
-	Out << "// \"candidate\" values matched a likely member name and should be verified.\n";
-	Out << "// \"manual\" values are vtable/function or stable struct offsets that\n";
-	Out << "// cannot be discovered through UClass reflection; the known 4.x value\n";
-	Out << "// is kept for compatibility.  \"fallback\" means the reflected member\n";
-	Out << "// was not found in this build and the known 4.x value is used.\n\n";
+	Out << "// Values are resolved from the live SDK dump, deepest match first:\n";
+	Out << "//   ClassName::Member   exact reflected member\n";
+	Out << "//   candidate: ...      likely member found by a hinted deep search\n";
+	Out << "//   vtable: ...         native UFunction slot resolved from the vtable\n";
+	Out << "//   manual: ...         stable struct offset that reflection cannot see\n";
+	Out << "//   fallback: ...       live build did not expose it; known 4.x value kept\n\n";
 
 	size_t Resolved = 0;
 	size_t Candidates = 0;
+	size_t VTableOffsets = 0;
 	size_t Manual = 0;
 	size_t Fallbacks = 0;
 
 	for (const PUBGOffsetSpec& Spec : GPUBGOffsetSpecs)
 	{
-		const bool bManual = (Spec.Kind == EPUBGOffsetKind::Manual);
-
 		uint32_t Offset = Spec.Fallback;
 		bool bFound = false;
-		std::string Owner;
+		bool bVTable = false;
+		PUBGResolveResult Result;
 
-		if (!bManual)
+		if (Spec.Resolve == EPUBGResolve::VTable)
+		{
+			for (const std::string& ClassName : SplitClassList(Spec.Classes))
+			{
+				auto It = Classes.find(ClassName);
+				if (It == Classes.end())
+					continue;
+
+				Result = ResolveVTableMember(It->second, Spec.Member);
+				if (Result.bFound)
+					break;
+			}
+
+			if (Result.bFound)
+			{
+				Offset = Result.Offset;
+				bFound = true;
+				bVTable = true;
+			}
+		}
+		else if (Spec.Resolve == EPUBGResolve::DeepMember)
+		{
+			const PUBGMemberMatch Match = FindDeepMember(Spec, AllClasses);
+			if (Match.bFound)
+			{
+				Result.bFound = true;
+				Result.Offset = Match.Offset;
+				Result.Owner = Match.Owner;
+				Result.Member = Match.Member;
+				Offset = Match.Offset;
+				bFound = true;
+			}
+		}
+		else if (Spec.Resolve == EPUBGResolve::Member)
 		{
 			for (const std::string& ClassName : SplitClassList(Spec.Classes))
 			{
@@ -858,11 +1312,16 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 					continue;
 
 				UEProperty Property;
+				std::string Owner;
 				if (FindMemberInHierarchy(It->second, Spec.Member, Property, Owner))
 				{
 					const int32 FoundOffset = Property.GetOffset();
 					if (FoundOffset > 0 && FoundOffset < 0x100000)
 					{
+						Result.bFound = true;
+						Result.Offset = static_cast<uint32_t>(FoundOffset);
+						Result.Owner = Owner;
+						Result.Member = Spec.Member;
 						Offset = static_cast<uint32_t>(FoundOffset);
 						bFound = true;
 					}
@@ -877,7 +1336,7 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 			<< std::uppercase << std::hex << std::setw(4) << std::setfill('0') << Offset
 			<< std::dec << std::nouppercase << std::setfill(' ') << "\"";
 
-		if (bManual)
+		if (Spec.Resolve == EPUBGResolve::Manual)
 		{
 			++Manual;
 			Out << " // manual";
@@ -886,17 +1345,26 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 		}
 		else if (bFound)
 		{
-			if (Spec.Kind == EPUBGOffsetKind::Candidate)
+			const bool bCandidate = (Spec.Kind == EPUBGOffsetKind::Candidate);
+
+			if (bVTable)
+			{
+				++VTableOffsets;
+				Out << " // vtable: " << Result.Owner << "::" << Result.Member;
+				if (Result.Via)
+					Out << " (" << Result.Via << ")";
+			}
+			else if (bCandidate)
 			{
 				++Candidates;
-				Out << " // candidate: " << Owner << "::" << Spec.Member;
+				Out << " // candidate: " << Result.Owner << "::" << Result.Member;
 				if (Spec.Note && *Spec.Note)
 					Out << " (" << Spec.Note << ")";
 			}
 			else
 			{
 				++Resolved;
-				Out << " // " << Owner << "::" << Spec.Member;
+				Out << " // " << Result.Owner << "::" << Result.Member;
 			}
 		}
 		else
@@ -905,7 +1373,7 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 			Out << " // fallback";
 			if (Spec.Note && *Spec.Note)
 				Out << ": " << Spec.Note;
-			Out << " (member not found)";
+			Out << (bVTable || Spec.Resolve == EPUBGResolve::VTable ? " (slot not found)" : " (member not found)");
 		}
 		Out << "\n";
 	}
@@ -913,8 +1381,8 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 	Out << "\n#endif // PUBGOffsets_hpp\n";
 	Out.close();
 
-	LogSuccess("DumpPUBGOffsetsHeader: wrote %s (%zu resolved, %zu candidates, %zu manual, %zu fallbacks)",
-		OutPath.string().c_str(), Resolved, Candidates, Manual, Fallbacks);
+	LogSuccess("DumpPUBGOffsetsHeader: wrote %s (%zu resolved, %zu candidates, %zu vtable, %zu manual, %zu fallbacks)",
+		OutPath.string().c_str(), Resolved, Candidates, VTableOffsets, Manual, Fallbacks);
 }
 
 namespace
