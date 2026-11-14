@@ -602,25 +602,36 @@ void DumpUEOffsetsHeader(const fs::path& DumperFolder)
 
 namespace
 {
+	enum class EPUBGOffsetKind : uint8_t
+	{
+		Reflected,  /* exact reflected member resolved from the live dump */
+		Candidate,  /* likely member; emitted for verification on the target build */
+		Manual,     /* vtable/function or stable struct offset; not reflected */
+	};
+
 	struct PUBGOffsetSpec
 	{
 		const char* Macro;
 		const char* Classes;   /* comma separated UClass names (A/U prefix stripped) */
 		const char* Member;
 		uint32_t Fallback;
+		EPUBGOffsetKind Kind = EPUBGOffsetKind::Reflected;
+		const char* Note = nullptr;
 	};
 
 	/* The macro names/values are the ones used by the common PUBG iOS bases.
-	 * Every entry is first resolved from the live dump; Fallback is only used
-	 * when the reflected member cannot be found (functions, obfuscated names,
-	 * or members that PUBG removed from a newer build). */
+	 * Reflected entries are resolved from the live dump.  Candidate entries use
+	 * a likely member name and are marked for verification.  Manual entries are
+	 * vtable/function offsets or stable struct offsets that reflection cannot
+	 * discover; they keep the known 4.x value and are documented in the output. */
 	const PUBGOffsetSpec GPUBGOffsetSpecs[] =
 	{
-		{ "kLineOfSightTo",              "",                            "",                        0x7A8  },
+		{ "kLineOfSightTo",              "",                            "",                        0x7A8, EPUBGOffsetKind::Manual,
+		  "AController::LineOfSightTo vtable byte offset (not a reflected field)" },
 		{ "kPersistentLevel",            "World",                       "PersistentLevel",         0x30   },
 		{ "kNetDriver",                  "World",                       "NetDriver",               0x38   },
 		{ "kServerConnection",           "NetDriver",                   "ServerConnection",        0x78   },
-		{ "kPlayerController",           "",                            "",                        0x98   },
+		{ "kPlayerController",           "NetConnection",               "OwningActor",             0x98   },
 		{ "klocalPlayerController",      "LocalPlayer",                 "PlayerController",        0x30   },
 		{ "kPawn",                       "Controller",                  "Pawn",                    0x4B8  },
 		{ "kCharacter",                  "Controller",                  "Character",               0x4C8  },
@@ -667,33 +678,44 @@ namespace
 		{ "kShootWeaponEffectComp",      "STExtraShootWeapon",          "ShootWeaponEffectComp",   0x1388 },
 		{ "kShootMode",                  "STExtraShootWeapon",          "ShootMode",               0x10F9 },
 		{ "kVehicleCommon",              "STExtraVehicleBase",          "VehicleCommon",           0x0C08 },
-		{ "kHP",                         "VehicleCommonComponent",      "HP",                      0x0354 },
+		{ "kHP",                         "VehicleCommonComponent",      "Hp",                      0x0354 },
 		{ "kHPMax",                      "VehicleCommonComponent",      "HPMax",                   0x0350 },
 		{ "kFuel",                       "VehicleCommonComponent",      "Fuel",                    0x043C },
 		{ "kFuelMax",                    "VehicleCommonComponent",      "FuelMax",                 0x0438 },
 		{ "kPickUpDataList",             "PickUpListWrapperActor,PickUpDataComponent", "PickUpDataList", 0x08D0 },
-		{ "kGoodsID",                    "",                            "",                        0x38   },
-		{ "kTableName",                  "",                            "",                        0x920  },
+		{ "kGoodsID",                    "",                            "",                        0x38, EPUBGOffsetKind::Manual,
+		  "box goods ID offset (stable 4.x struct offset, not reflected)" },
+		{ "kTableName",                  "PickUpListWrapperActor,PickUpWrapperActor,PickUpDataComponent,PlayerTombBox",
+		                                                                "ItemTableName",           0x920, EPUBGOffsetKind::Candidate,
+		  "box item table FString; verify on target" },
 		{ "kCurrentStates",              "STExtraCharacter",            "CurrentStates",           0x1058 },
-		{ "kFPS",                        "",                            "",                        0x1C4  },
-		{ "kBP_MapUIMarkManager_C",      "",                            "",                        0x4270 },
+		{ "kFPS",                        "",                            "",                        0x1C4, EPUBGOffsetKind::Manual,
+		  "legacy FPS offset kept for base compatibility (not reflected; usually unused)" },
+		{ "kBP_MapUIMarkManager_C",      "BP_STExtraPlayerController_C,STExtraPlayerController_C",
+		                                                                "BP_MapUIMarkManager",     0x4270, EPUBGOffsetKind::Candidate,
+		  "blueprint component pointer on the player controller; verify on target" },
 		{ "kpExtraGameState",            "MapUIMarkManager",            "pExtraGameState",         0x0428 },
 		{ "kAlivePlayerNum",             "STExtraGameStateBase",        "AlivePlayerNum",          0x0BB4 },
 		{ "kPlayerNum",                  "STExtraGameStateBase",        "PlayerNum",               0x0818 },
 		{ "kelapsedSeconds",             "GameState",                   "ElapsedTime",             0x04DC },
 		{ "kPlayerState",                "Controller",                  "PlayerState",             0x04D0 },
 		{ "kKill",                       "UAEPlayerState",              "Kills",                   0x06C8 },
-		{ "kTPP",                        "",                            "",                        0x1C50 },
-		{ "kFPP",                        "",                            "",                        0x1C60 },
+		{ "kTPP",                        "STExtraBaseCharacter",        "ThirdPersonCameraComponent", 0x1C50, EPUBGOffsetKind::Candidate,
+		  "inferred from the kTPP name; verify on target" },
+		{ "kFPP",                        "STExtraBaseCharacter",        "FPPCameraComp",           0x1C60, EPUBGOffsetKind::Candidate,
+		  "inferred from the kFPP name; verify on target" },
 		{ "kGameReplayType",             "UAEPlayerController",         "GameReplayType",          0x0944 },
-		{ "kPickUpAnim",                 "STExtraBaseCharacter",        "PickUpAnim",              0x1E28 },
+		{ "kPickUpAnim",                 "STExtraBaseCharacter",        "MainCharAnimClass",       0x1E28 },
 		{ "kPressingFireBtn",            "STExtraPlayerController",     "bIsPressingFireBtn",      0x33D0 },
 		{ "kCurrentReloadWeapon",        "STExtraBaseCharacter",        "CurrentReloadWeapon",     0x2B58 },
 		{ "kCachedBulletTrackComponent", "STExtraShootWeapon",          "CachedBulletTrackComponent", 0x0E28 },
-		{ "wuhou",                       "",                            "",                        0x190  },
-		{ "kYaw",                        "",                            "",                        0x888  },
-		{ "kRoll",                       "",                            "",                        0x890  },
-		{ "kPitch",                      "",                            "",                        0x880  },
+		{ "wuhou",                       "SceneComponent",              "RelativeRotation",        0x190  },
+		{ "kYaw",                        "",                            "",                        0x888, EPUBGOffsetKind::Manual,
+		  "APlayerController::AddYawInput vtable byte offset (not a reflected field)" },
+		{ "kRoll",                       "",                            "",                        0x890, EPUBGOffsetKind::Manual,
+		  "APlayerController::AddRollInput vtable byte offset (not a reflected field)" },
+		{ "kPitch",                      "",                            "",                        0x880, EPUBGOffsetKind::Manual,
+		  "APlayerController::AddPitchInput vtable byte offset (not a reflected field)" },
 	};
 
 	std::vector<std::string> SplitClassList(const char* List)
@@ -807,52 +829,83 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 	Out << "#ifndef PUBGOffsets_hpp\n";
 	Out << "#define PUBGOffsets_hpp\n\n";
 	Out << "// Auto-generated by Dumper-7 (iOS port) for PUBG Mobile.\n";
-	Out << "// Values are resolved from the live SDK dump; entries marked as\n";
-	Out << "// fallback could not be found by name and use the known 4.x offset.\n\n";
+	Out << "// Reflected values were resolved from the live SDK dump.\n";
+	Out << "// \"candidate\" values matched a likely member name and should be verified.\n";
+	Out << "// \"manual\" values are vtable/function or stable struct offsets that\n";
+	Out << "// cannot be discovered through UClass reflection; the known 4.x value\n";
+	Out << "// is kept for compatibility.  \"fallback\" means the reflected member\n";
+	Out << "// was not found in this build and the known 4.x value is used.\n\n";
 
 	size_t Resolved = 0;
+	size_t Candidates = 0;
+	size_t Manual = 0;
 	size_t Fallbacks = 0;
 
 	for (const PUBGOffsetSpec& Spec : GPUBGOffsetSpecs)
 	{
+		const bool bManual = (Spec.Kind == EPUBGOffsetKind::Manual);
+
 		uint32_t Offset = Spec.Fallback;
 		bool bFound = false;
 		std::string Owner;
 
-		for (const std::string& ClassName : SplitClassList(Spec.Classes))
+		if (!bManual)
 		{
-			auto It = Classes.find(ClassName);
-			if (It == Classes.end())
-				continue;
-
-			UEProperty Property;
-			if (FindMemberInHierarchy(It->second, Spec.Member, Property, Owner))
+			for (const std::string& ClassName : SplitClassList(Spec.Classes))
 			{
-				const int32 FoundOffset = Property.GetOffset();
-				if (FoundOffset > 0 && FoundOffset < 0x100000)
-				{
-					Offset = static_cast<uint32_t>(FoundOffset);
-					bFound = true;
-				}
-			}
+				auto It = Classes.find(ClassName);
+				if (It == Classes.end())
+					continue;
 
-			if (bFound)
-				break;
+				UEProperty Property;
+				if (FindMemberInHierarchy(It->second, Spec.Member, Property, Owner))
+				{
+					const int32 FoundOffset = Property.GetOffset();
+					if (FoundOffset > 0 && FoundOffset < 0x100000)
+					{
+						Offset = static_cast<uint32_t>(FoundOffset);
+						bFound = true;
+					}
+				}
+
+				if (bFound)
+					break;
+			}
 		}
 
 		Out << "#define " << Spec.Macro << " \"0x"
 			<< std::uppercase << std::hex << std::setw(4) << std::setfill('0') << Offset
 			<< std::dec << std::nouppercase << std::setfill(' ') << "\"";
 
-		if (bFound)
+		if (bManual)
 		{
-			++Resolved;
-			Out << " // " << Owner << "::" << Spec.Member;
+			++Manual;
+			Out << " // manual";
+			if (Spec.Note && *Spec.Note)
+				Out << ": " << Spec.Note;
+		}
+		else if (bFound)
+		{
+			if (Spec.Kind == EPUBGOffsetKind::Candidate)
+			{
+				++Candidates;
+				Out << " // candidate: " << Owner << "::" << Spec.Member;
+				if (Spec.Note && *Spec.Note)
+					Out << " (" << Spec.Note << ")";
+			}
+			else
+			{
+				++Resolved;
+				Out << " // " << Owner << "::" << Spec.Member;
+			}
 		}
 		else
 		{
 			++Fallbacks;
-			Out << " // fallback (member not found)";
+			Out << " // fallback";
+			if (Spec.Note && *Spec.Note)
+				Out << ": " << Spec.Note;
+			Out << " (member not found)";
 		}
 		Out << "\n";
 	}
@@ -860,8 +913,8 @@ void DumpPUBGOffsetsHeader(const fs::path& GameFolder)
 	Out << "\n#endif // PUBGOffsets_hpp\n";
 	Out.close();
 
-	LogSuccess("DumpPUBGOffsetsHeader: wrote %s (%zu resolved, %zu fallbacks)",
-		OutPath.string().c_str(), Resolved, Fallbacks);
+	LogSuccess("DumpPUBGOffsetsHeader: wrote %s (%zu resolved, %zu candidates, %zu manual, %zu fallbacks)",
+		OutPath.string().c_str(), Resolved, Candidates, Manual, Fallbacks);
 }
 
 namespace
